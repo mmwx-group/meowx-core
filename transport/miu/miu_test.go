@@ -1892,6 +1892,51 @@ func TestReplayClosesIdleLanes(t *testing.T) {
 	testFinish(t, stream)
 }
 
+// The downlink finds the lane from the pool dead and the replay cannot dial (the
+// network is down): the stream is left without a lane. A write after that has to
+// fail with why, not go to the nil lane — that took the whole core down, and with
+// it the network of the router it ran on.
+func TestReplayFailsThenWrite(t *testing.T) {
+	s := newTestServer(t)
+	c, events := newTestClient(t, s, func(conn net.Conn) net.Conn { return &opaqueConn{Conn: conn} })
+	stream := testOpen(t, c, echoDst)
+	testEcho(t, stream, []byte("x"))
+	testFinish(t, stream)
+	if len(c.idleLanes()) != 1 {
+		t.Fatal("no idle lane")
+	}
+	s.ln.Close()   // nothing to dial any more
+	s.closeConns() // the lane dies, unseen by the peek
+	testWait(t, "the connections to close", func() bool { return s.live.Load() == 0 })
+
+	stream = testOpen(t, c, echoDst)
+	stream.timer.Stop() // no OPEN of its own: the downlink is the first to find out
+	_ = stream.SetReadDeadline(time.Now().Add(10 * time.Second))
+	if _, err := stream.Read(make([]byte, 16)); err == nil || err == io.EOF || isTimeout(err) {
+		t.Fatalf("read on a dead lane with nothing to dial: %v", err)
+	}
+	stream.smu.Lock()
+	l, fail := stream.l, stream.fail
+	stream.smu.Unlock()
+	if l != nil || fail == nil {
+		t.Fatalf("the failed replay should leave no lane and a reason: lane=%v fail=%v", l, fail)
+	}
+
+	if _, err := stream.Write([]byte("after")); err == nil {
+		t.Fatal("a write without a lane went through")
+	}
+	if _, err := stream.Write([]byte("again")); err == nil {
+		t.Fatal("and again")
+	}
+	if err := stream.CloseWrite(); err == nil {
+		t.Fatal("END without a lane went through")
+	}
+	if events.count("replay") != 0 {
+		t.Fatalf("replays=%d", events.count("replay"))
+	}
+	stream.Close()
+}
+
 // ETIMEDOUT from the kernel is not a deadline of the stream.
 func TestIsTimeoutOnlyDeadlines(t *testing.T) {
 	if !isTimeout(os.ErrDeadlineExceeded) || !isTimeout(&net.OpError{Op: "read", Err: os.ErrDeadlineExceeded}) {

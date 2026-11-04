@@ -179,10 +179,19 @@ func (s *Stream) push(p []byte, end bool) error {
 		return io.ErrClosedPipe
 	}
 	s.smu.Lock()
-	l := s.l
+	l, fail := s.l, s.fail
 	s.smu.Unlock()
 	if s.closed.Load() {
 		return io.ErrClosedPipe
+	}
+	if l == nil {
+		// With wmu held nobody is replacing the lane: the downlink did and got
+		// none (the replay could not dial), fail tells why.
+		if fail == nil {
+			fail = io.ErrClosedPipe
+		}
+		s.werr = fail
+		return fail
 	}
 	if s.keep {
 		if s.gotDown.Load() || len(s.sent)+len(p) > replayLimit {

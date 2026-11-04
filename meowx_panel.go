@@ -1,0 +1,978 @@
+package main
+
+// MeowX OpenWrt 版的主控账户：用主控网页「扫码登录」弹窗里复制的登录链接登录（路由器没有扫码环境、也装不了客户端，
+// 只能在浏览器里管理）。由 LuCI 经 rpcd 调用，输出一行 JSON：
+//
+//	meowx-core panel login 'miaomiaowu://login?host=…&code=…'
+//	meowx-core panel status | profile | subscriptions | firewall | report | logout
+//	meowx-core panel po0 status | enable | disable | fetch | add <地址> <token> | remove <序号>
+//	meowx-core panel ggy status | enable | disable | add <token 或分享链接> | remove <序号> | report（meowx_ggy.go）
+//
+// 加密信道与 iOS / Android 客户端同一套（主控 /api/secure/cert + /api/secure/rpc）：许可证服务用 Ed25519 签发的主控证书
+// → 每次请求一把临时 X25519 密钥 + HKDF-SHA256 派生收发两把 key → ChaCha20-Poly1305。
+// 账户状态存 /etc/meowx/panel.json（0600，只有 root 读得到）。
+
+import (
+	"bytes"
+	"context"
+	"crypto/ecdh"
+	"crypto/ed25519"
+	"crypto/rand"
+	"crypto/sha256"
+	"crypto/tls"
+	"encoding/base64"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"net/url"
+	"os"
+	"path/filepath"
+	"regexp"
+	"strconv"
+	"strings"
+	"time"
+
+	"golang.org/x/crypto/chacha20poly1305"
+	"golang.org/x/crypto/hkdf"
+)
+
+// 许可证服务的 Ed25519 验签公钥（与客户端内置的同一把）。
+const panelLicenseKey = "/cKXW8AIOPE6ChoZtXjP8N+KkIYvKLvnpLyaLPrpTQM="
+
+var panelStatePath = "/etc/meowx/panel.json"
+
+type panelState struct {
+	Base      string `json:"base"`
+	Token     string `json:"token"`
+	Username  string `json:"username,omitempty"`
+	Avatar    string `json:"avatar,omitempty"`
+	ReportURL string `json:"report_url,omitempty"`
+	LoginAt   int64  `json:"login_at,omitempty"`
+}
+
+// 访问主控与上报白名单都必须直连（主控只把来源 IP 加白；走代理会把节点的 IP 加进去，同客户端「上报必须直连」）。
+// 路由器开着透明代理时，路由器自己发出的流量也会被送进内核，只有 meowx 服务 cgroup 里的进程会被防火墙规则放行
+// （见 hijack.ut 的 router 链）——所以子命令一启动就把自己挪进那个 cgroup。DNS 也不能走 dnsmasq：它的上游查询
+// 同样会被劫持，fake-ip 下拿到的是假地址；直接问公共 DNS，都不行才退回系统解析。
+var panelHTTP = &http.Client{
+	Timeout:   20 * time.Second,
+	Transport: &http.Transport{Proxy: nil, DialContext: panelDial, TLSHandshakeTimeout: 10 * time.Second, ForceAttemptHTTP2: true},
+}
+
+var panelDNSServers = []string{"223.5.5.5:53", "119.29.29.29:53", "1.1.1.1:53"}
+
+func panelDial(ctx context.Context, network, addr string) (net.Conn, error) {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return nil, err
+	}
+	dialer := &net.Dialer{Timeout: 10 * time.Second}
+	if ip := net.ParseIP(host); ip != nil {
+		return dialer.DialContext(ctx, network, addr)
+	}
+	var ips []net.IPAddr
+	for _, server := range panelDNSServers {
+		resolver := &net.Resolver{PreferGo: true, Dial: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			return (&net.Dialer{Timeout: 3 * time.Second}).DialContext(ctx, "udp", server)
+		}}
+		lctx, cancel := context.WithTimeout(ctx, 4*time.Second)
+		ips, err = resolver.LookupIPAddr(lctx, host)
+		cancel()
+		if err == nil && len(ips) > 0 {
+			break
+		}
+	}
+	if len(ips) == 0 {
+		// 都问不到（比如上游 UDP 53 被封）：退回系统解析
+		systemResolver := &net.Resolver{PreferGo: true}
+		if ips, err = systemResolver.LookupIPAddr(ctx, host); err != nil {
+			return nil, err
+		}
+	}
+	var lastErr error
+	for _, ip := range ips {
+		conn, err := dialer.DialContext(ctx, network, net.JoinHostPort(ip.IP.String(), port))
+		if err == nil {
+			return conn, nil
+		}
+		lastErr = err
+	}
+	return nil, lastErr
+}
+
+// 挪进 meowx 服务的 cgroup（名字取 /etc/config/meowx 的 routing.cgroup_name，缺省 meowx）。服务没在跑时这些目录不存在，
+// 那时也没有透明代理，什么都不用做。
+func panelBypassProxy() {
+	name := "meowx"
+	if data, err := os.ReadFile("/etc/config/meowx"); err == nil {
+		if m := regexp.MustCompile(`option\s+'?cgroup_name'?\s+'?([A-Za-z0-9_.-]+)'?`).FindSubmatch(data); m != nil {
+			name = string(m[1])
+		}
+	}
+	pid := []byte(strconv.Itoa(os.Getpid()))
+	if parent := "/sys/fs/cgroup/services/" + name; panelIsDir(parent) {
+		child := parent + "/panel"
+		_ = os.Mkdir(child, 0o755)
+		_ = os.WriteFile(child+"/cgroup.procs", pid, 0o644)
+	}
+	if v1 := "/sys/fs/cgroup/net_cls/" + name; panelIsDir(v1) {
+		_ = os.WriteFile(v1+"/cgroup.procs", pid, 0o644)
+	}
+}
+
+func panelIsDir(path string) bool {
+	st, err := os.Stat(path)
+	return err == nil && st.IsDir()
+}
+
+func panelMain(args []string) int {
+	if v := os.Getenv("MEOWX_PANEL_STATE"); v != "" {
+		panelStatePath = v
+	}
+	if v := os.Getenv("MEOWX_PO0_STATE"); v != "" {
+		po0StatePath = v
+	}
+	if v := os.Getenv("MEOWX_GGY_RESULTS"); v != "" {
+		ggyResultPath = v
+	}
+	if v := os.Getenv("MEOWX_APP_LOG"); v != "" {
+		ggyAppLogPath = v
+	}
+	panelBypassProxy()
+	if len(args) == 0 {
+		fmt.Fprintln(os.Stderr, "usage: meowx-core panel login <link> | status | profile | subscriptions | firewall | report | logout | po0 … | ggy …")
+		return 2
+	}
+	var out any
+	var err error
+	switch args[0] {
+	case "login":
+		if len(args) < 2 {
+			err = errors.New("missing login link")
+		} else {
+			out, err = panelLogin(args[1])
+		}
+	case "status":
+		out, err = panelStatus()
+	case "profile":
+		out, err = panelProfile()
+	case "subscriptions":
+		out, err = panelSubscriptions()
+	case "firewall":
+		out, err = panelFirewall()
+	case "report":
+		out, err = panelReport()
+	case "po0":
+		out, err = po0Main(args[1:])
+	case "ggy":
+		out, err = ggyMain(args[1:])
+	case "logout":
+		err = os.Remove(panelStatePath)
+		if errors.Is(err, os.ErrNotExist) {
+			err = nil
+		}
+		// 主控下发的 po0 列表跟着账号走、退出就清；开关与自己添加的是本机偏好，留着（同客户端）
+		if po, e := loadPo0State(); e == nil && len(po.Panel) > 0 {
+			po.Panel, po.PanelFetchedAt = nil, 0
+			_ = po.save()
+		}
+		out = map[string]any{"success": true}
+	default:
+		err = fmt.Errorf("unknown command %q", args[0])
+	}
+	enc := json.NewEncoder(os.Stdout)
+	enc.SetEscapeHTML(false)
+	if err != nil {
+		_ = enc.Encode(map[string]any{"success": false, "error": err.Error()})
+		return 1
+	}
+	_ = enc.Encode(out)
+	return 0
+}
+
+// ---------- 登录 ----------
+
+// 登录链接 = miaomiaowu://login?host=<主控 base>&code=<一次性码>（与客户端扫的二维码同一串；host 可能不带 scheme）
+func parseLoginLink(raw string) (base, code string, err error) {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || u.Scheme != "miaomiaowu" || u.Host != "login" {
+		return "", "", errors.New("不是妙妙屋的登录链接")
+	}
+	host := strings.TrimSpace(u.Query().Get("host"))
+	code = u.Query().Get("code")
+	if host == "" || code == "" {
+		return "", "", errors.New("登录链接不完整")
+	}
+	if !strings.Contains(host, "://") {
+		host = "https://" + host
+	}
+	b, err := url.Parse(host)
+	if err != nil || b.Host == "" || (b.Scheme != "https" && b.Scheme != "http") {
+		return "", "", errors.New("登录链接里的主控地址无效")
+	}
+	return b.Scheme + "://" + b.Host, code, nil
+}
+
+func panelLogin(link string) (any, error) {
+	base, code, err := parseLoginLink(link)
+	if err != nil {
+		return nil, err
+	}
+	obj, err := panelRPC(base, "/login/qr", "POST", "", map[string]any{"code": code})
+	if err != nil {
+		return nil, err
+	}
+	token, _ := obj["token"].(string)
+	if token == "" {
+		return nil, panelServerError(obj, "登录失败（登录链接已用过或已过期，请在主控上重新复制）")
+	}
+	st := &panelState{Base: base, Token: token, LoginAt: time.Now().Unix()}
+	st.applyProfile(obj)
+	// 白名单上报地址跟着账号走：登录时就取，拿不到不影响登录
+	if fw, err := panelRPC(base, "/user/firewall-token", "GET", token, nil); err == nil {
+		st.ReportURL, _ = fw["report_url"].(string)
+	}
+	if err := st.save(); err != nil {
+		return nil, err
+	}
+	return map[string]any{"success": true, "username": st.Username, "avatar": st.Avatar, "base": st.Base}, nil
+}
+
+// 昵称优先、没有用用户名；主控上传的头像是站内路径，补成绝对地址（同客户端 AccountProfile）
+func (st *panelState) applyProfile(obj map[string]any) {
+	if nick, _ := obj["nickname"].(string); nick != "" {
+		st.Username = nick
+	} else if name, _ := obj["username"].(string); name != "" {
+		st.Username = name
+	}
+	if avatar, _ := obj["avatar_url"].(string); avatar != "" {
+		if strings.HasPrefix(avatar, "/") {
+			avatar = st.Base + avatar
+		}
+		st.Avatar = avatar
+	}
+}
+
+func panelStatus() (any, error) {
+	st, err := loadPanelState()
+	if err != nil {
+		return map[string]any{"success": true, "logged_in": false}, nil
+	}
+	return map[string]any{"success": true, "logged_in": true, "username": st.Username, "avatar": st.Avatar,
+		"base": st.Base, "report_url": st.ReportURL != ""}, nil
+}
+
+// 向主控重取昵称与头像（只在用户点刷新时调，同客户端）
+func panelProfile() (any, error) {
+	st, err := loadPanelState()
+	if err != nil {
+		return nil, err
+	}
+	obj, err := panelRPC(st.Base, "/user/profile", "GET", st.Token, nil)
+	if err != nil {
+		return nil, err
+	}
+	if name, _ := obj["username"].(string); name == "" {
+		return nil, panelServerError(obj, "取账户信息失败（会话可能已失效，请重新登录）")
+	}
+	st.applyProfile(obj)
+	if err := st.save(); err != nil {
+		return nil, err
+	}
+	return map[string]any{"success": true, "username": st.Username, "avatar": st.Avatar}, nil
+}
+
+// ---------- 账户订阅 ----------
+
+func panelSubscriptions() (any, error) {
+	st, err := loadPanelState()
+	if err != nil {
+		return nil, err
+	}
+	// 订阅令牌（不是会话 token）：没有短链的旧式订阅要用它拼 /api/clash/subscribe
+	subToken := ""
+	if obj, err := panelRPC(st.Base, "/user/token", "GET", st.Token, nil); err == nil {
+		subToken, _ = obj["token"].(string)
+	}
+	raw, err := panelRPCRaw(st.Base, "/subscriptions", "GET", st.Token, nil)
+	if err != nil {
+		return nil, err
+	}
+	var root any
+	_ = json.Unmarshal(raw, &root)
+	var items []any
+	switch v := root.(type) {
+	case []any:
+		items = v
+	case map[string]any:
+		for _, k := range []string{"subscriptions", "items", "data"} {
+			if arr, ok := v[k].([]any); ok {
+				items = arr
+				break
+			}
+		}
+		if items == nil {
+			if msg, _ := v["error"].(string); msg != "" {
+				return nil, errors.New(msg)
+			}
+		}
+	}
+	list := make([]map[string]any, 0, len(items))
+	for _, it := range items {
+		m, _ := it.(map[string]any)
+		if m == nil {
+			continue
+		}
+		filename, _ := m["filename"].(string)
+		path, _ := m["subscription_path"].(string)
+		path = strings.TrimSpace(path)
+		name, _ := m["name"].(string)
+		if name == "" {
+			name = filename
+		}
+		// subscription_path 只有是短链（/x/{code}）时才自带凭证；主控关掉短链接（或这份订阅没有短码）时给的是
+		// /api/clash/subscribe?filename=…、/api/user/package-subscribe?assignment_id=… / ?merged=1，要补 token=<订阅令牌>
+		// （主控网页 buildSubscriptionURL 同样这么拼）。不补的话主控按令牌无效回「订阅已过期」的占位配置（同客户端的修复）
+		link := ""
+		if path != "" {
+			if u, err := url.Parse(st.Base); err == nil {
+				if p, err := url.Parse(path); err == nil {
+					full := u.ResolveReference(p)
+					q := full.Query()
+					if !strings.HasPrefix(full.Path, "/x/") && q.Get("token") == "" {
+						if subToken == "" {
+							continue
+						}
+						q.Set("token", subToken)
+						full.RawQuery = q.Encode()
+					}
+					link = full.String()
+				}
+			}
+		} else if subToken != "" && filename != "" {
+			link = st.Base + "/api/clash/subscribe?" + url.Values{"token": {subToken}, "filename": {filename}, "t": {"clash"}}.Encode()
+		}
+		if link == "" {
+			continue
+		}
+		entry := map[string]any{"name": name, "url": link, "filename": filename, "path": path}
+		for _, k := range []string{"expire_at", "traffic_used", "traffic_total"} {
+			if v, ok := m[k]; ok {
+				entry[k] = v
+			}
+		}
+		list = append(list, entry)
+	}
+	return map[string]any{"success": true, "base": st.Base, "subscriptions": list}, nil
+}
+
+// ---------- 客户端 IP 白名单 ----------
+
+// 重新取上报地址（主控上换了 token 时）
+func panelFirewall() (any, error) {
+	st, err := loadPanelState()
+	if err != nil {
+		return nil, err
+	}
+	obj, err := panelRPC(st.Base, "/user/firewall-token", "GET", st.Token, nil)
+	if err != nil {
+		return nil, err
+	}
+	report, _ := obj["report_url"].(string)
+	if report == "" {
+		return nil, panelServerError(obj, "主控没有给出白名单上报地址")
+	}
+	st.ReportURL = report
+	if err := st.save(); err != nil {
+		return nil, err
+	}
+	return map[string]any{"success": true}, nil
+}
+
+// 上报客户端 IP 白名单：主控 report_url（登录了才有）+ 开着 po0 时的各台 po0（主控下发的 + 自己添加的）。
+// IPv4 / IPv6 各报一次（同客户端：白名单一开，没列进名单的 v6 源同样被拦；只有 v4 的网络里 v6 那发失败不算错）。
+// po0 用自签证书，只对它跳过证书校验，且要带 Content-Type: application/json；403 = token 无效。
+// 最后是开着 GGY 加白时的各个 token（与主控账户无关、没登录也报；只走 IPv4、照常校验证书，见 meowx_ggy.go）。
+func panelReport() (any, error) {
+	var results []map[string]any
+	st, _ := loadPanelState()
+	if st != nil && st.ReportURL != "" {
+		results = append(results, reportTarget("panel", st.ReportURL, false)...)
+	}
+	po, _ := loadPo0State()
+	if po.Enabled {
+		if st != nil && time.Now().Unix()-po.PanelFetchedAt > 6*3600 {
+			_, _ = po0Fetch(st, po) // 列表 6 小时没刷新就顺带重取（管理员可能在主控加减了 po0）
+		}
+		for _, u := range po.reportURLs() {
+			results = append(results, reportTarget("po0", u, true)...)
+		}
+	}
+	if ggy := loadGGYConfig(); ggy.Enabled && len(ggy.Tokens) > 0 {
+		results = append(results, ggyReport(ggy.Tokens)...)
+	}
+	ok := false
+	for _, r := range results {
+		if r["ok"] == true {
+			ok = true
+		}
+	}
+	return map[string]any{"success": ok || len(results) == 0, "results": results}, nil
+}
+
+func reportTarget(kind, target string, po0 bool) []map[string]any {
+	u, err := url.Parse(target)
+	if err != nil {
+		return []map[string]any{{"kind": kind, "ok": false, "error": err.Error()}}
+	}
+	families := []string{"tcp4", "tcp6"}
+	if ip := net.ParseIP(u.Hostname()); ip != nil {
+		if ip.To4() != nil {
+			families = []string{"tcp4"}
+		} else {
+			families = []string{"tcp6"}
+		}
+	}
+	var out []map[string]any
+	for _, family := range families {
+		res := map[string]any{"kind": kind, "host": u.Host, "family": family}
+		status, err := reportOnce(target, family, po0)
+		switch {
+		case err != nil:
+			res["ok"], res["error"] = false, err.Error()
+		case status == http.StatusOK:
+			res["ok"] = true
+		case status == http.StatusForbidden && po0:
+			res["ok"], res["error"] = false, "token 无效（403），到主控里重新登记这台 po0"
+		default:
+			res["ok"], res["error"] = false, fmt.Sprintf("HTTP %d", status)
+		}
+		out = append(out, res)
+	}
+	return out
+}
+
+func reportOnce(target, family string, po0 bool) (int, error) {
+	transport := &http.Transport{
+		Proxy: nil,
+		DialContext: func(ctx context.Context, _, addr string) (net.Conn, error) {
+			return panelDial(ctx, family, addr)
+		},
+		TLSHandshakeTimeout: 10 * time.Second,
+	}
+	if po0 {
+		transport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
+	}
+	client := &http.Client{Timeout: 15 * time.Second, Transport: transport}
+	req, err := http.NewRequest("POST", target, nil)
+	if err != nil {
+		return 0, err
+	}
+	req.Header.Set("Content-Length", "0")
+	if po0 {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+	return resp.StatusCode, nil
+}
+
+// ---------- po0 加白（同客户端「po0 加白」：主控下发的 + 自己添加的，总开关缺省关）----------
+
+var po0StatePath = "/etc/meowx/po0.json"
+
+type po0Custom struct {
+	Address string `json:"address"`
+	Token   string `json:"token"`
+}
+
+type po0PanelServer struct {
+	Name string `json:"name,omitempty"`
+	URL  string `json:"url"`
+}
+
+type po0State struct {
+	Enabled        bool             `json:"enabled"`
+	Custom         []po0Custom      `json:"custom,omitempty"`
+	Panel          []po0PanelServer `json:"panel,omitempty"`
+	PanelFetchedAt int64            `json:"panel_fetched_at,omitempty"`
+	// 实际上报的地址（主控下发的在前、自己添加的在后，去重）：mixin 据此给每台 po0 加直连规则
+	ReportURLs []string `json:"report_urls,omitempty"`
+}
+
+func loadPo0State() (*po0State, error) {
+	po := &po0State{}
+	data, err := os.ReadFile(po0StatePath)
+	if err != nil {
+		return po, err
+	}
+	_ = json.Unmarshal(data, po)
+	return po, nil
+}
+
+func (po *po0State) reportURLs() []string {
+	var out []string
+	add := func(u string) {
+		for _, x := range out {
+			if x == u {
+				return
+			}
+		}
+		out = append(out, u)
+	}
+	if !po.Enabled {
+		return nil
+	}
+	for _, s := range po.Panel {
+		add(s.URL)
+	}
+	for _, c := range po.Custom {
+		if u := po0ReportURL(c.Address, c.Token); u != "" {
+			add(u)
+		}
+	}
+	return out
+}
+
+func (po *po0State) save() error {
+	po.ReportURLs = po.reportURLs()
+	data, err := json.Marshal(po)
+	if err != nil {
+		return err
+	}
+	tmp := po0StatePath + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, po0StatePath)
+}
+
+func po0Main(args []string) (any, error) {
+	po, _ := loadPo0State()
+	cmd := "status"
+	if len(args) > 0 {
+		cmd = args[0]
+	}
+	switch cmd {
+	case "status":
+	case "enable":
+		po.Enabled = true
+		if st, err := loadPanelState(); err == nil {
+			_, _ = po0Fetch(st, po)
+		}
+	case "disable":
+		// 关掉：不拉列表、列表清空（同客户端）；自己添加的留着，下次打开接着用
+		po.Enabled = false
+		po.Panel = nil
+		po.PanelFetchedAt = 0
+	case "fetch":
+		st, err := loadPanelState()
+		if err != nil {
+			return nil, err
+		}
+		if _, err := po0Fetch(st, po); err != nil {
+			return nil, err
+		}
+	case "add":
+		if len(args) < 3 {
+			return nil, errors.New("用法：po0 add <地址> <token>")
+		}
+		address := normalizePo0Address(args[1])
+		if address == "" {
+			return nil, errors.New("地址不合法：填 IP 或域名，可带端口")
+		}
+		token := strings.TrimSpace(args[2])
+		if !isValidPo0Token(token) {
+			return nil, errors.New("token 不合法：应为 pgnfw_ 开头")
+		}
+		replaced := false
+		for i, c := range po.Custom {
+			if c.Address == address {
+				po.Custom[i].Token = token // 同一地址再加一次 = 换 token
+				replaced = true
+			}
+		}
+		if !replaced {
+			if len(po.Custom) >= 16 {
+				return nil, errors.New("最多 16 台") // 同客户端 UserOverridesStore.maxEntries
+			}
+			po.Custom = append(po.Custom, po0Custom{Address: address, Token: token})
+		}
+	case "remove":
+		if len(args) < 2 {
+			return nil, errors.New("用法：po0 remove <序号>")
+		}
+		i, err := strconv.Atoi(args[1])
+		if err != nil || i < 0 || i >= len(po.Custom) {
+			return nil, errors.New("没有这一项")
+		}
+		po.Custom = append(po.Custom[:i], po.Custom[i+1:]...)
+	default:
+		return nil, fmt.Errorf("unknown po0 command %q", cmd)
+	}
+	if cmd != "status" {
+		if err := po.save(); err != nil {
+			return nil, err
+		}
+	}
+	// 界面只拿脱敏的 token（完整的只在路由器上）
+	custom := make([]map[string]any, 0, len(po.Custom))
+	for _, c := range po.Custom {
+		custom = append(custom, map[string]any{"address": c.Address, "token": maskPo0Token(c.Token)})
+	}
+	panel := make([]map[string]any, 0, len(po.Panel))
+	for _, s := range po.Panel {
+		host := ""
+		if u, err := url.Parse(s.URL); err == nil {
+			host = u.Host
+		}
+		panel = append(panel, map[string]any{"name": s.Name, "host": host})
+	}
+	return map[string]any{"success": true, "enabled": po.Enabled, "custom": custom, "panel": panel,
+		"report_count": len(po.reportURLs()), "fetched_at": po.PanelFetchedAt}, nil
+}
+
+// GET /user/po0-servers：该用户可访问节点所在的那几台 po0（url 已按主控的「加白地址」拼好）
+func po0Fetch(st *panelState, po *po0State) (bool, error) {
+	obj, err := panelRPC(st.Base, "/user/po0-servers", "GET", st.Token, nil)
+	if err != nil {
+		return false, err
+	}
+	if ok, _ := obj["success"].(bool); !ok {
+		return false, panelServerError(obj, "取 po0 服务器列表失败")
+	}
+	servers, _ := obj["servers"].([]any)
+	list := make([]po0PanelServer, 0, len(servers))
+	for _, it := range servers {
+		m, _ := it.(map[string]any)
+		u, _ := m["url"].(string)
+		if _, err := url.Parse(u); u == "" || err != nil {
+			continue
+		}
+		name, _ := m["name"].(string)
+		list = append(list, po0PanelServer{Name: name, URL: u})
+	}
+	po.Panel = list
+	po.PanelFetchedAt = time.Now().Unix()
+	return true, po.save()
+}
+
+// 地址规范化（三端与主控同一套）：去掉 http(s):// 与结尾的 /；剩下必须是 host 或 host:port——host 为四段 IPv4、
+// IPv6（带端口写成 [v6]:port）或域名，port 1–65535（去前导 0）；host 小写，IPv6 一律带方括号。不合法返回 ""。
+func normalizePo0Address(raw string) string {
+	s := strings.TrimSpace(raw)
+	for _, scheme := range []string{"https://", "http://"} {
+		if strings.HasPrefix(strings.ToLower(s), scheme) {
+			s = s[len(scheme):]
+		}
+	}
+	s = strings.TrimRight(s, "/")
+	if s == "" || strings.ContainsAny(s, "/?#@ \t%") {
+		return ""
+	}
+	var host, port string
+	switch {
+	case strings.HasPrefix(s, "["):
+		end := strings.Index(s, "]")
+		if end < 0 {
+			return ""
+		}
+		host = s[1:end]
+		rest := s[end+1:]
+		if rest != "" {
+			if !strings.HasPrefix(rest, ":") {
+				return ""
+			}
+			port = rest[1:]
+			if port == "" {
+				return ""
+			}
+		}
+		if ip := net.ParseIP(host); ip == nil || ip.To4() != nil || !strings.Contains(host, ":") {
+			return ""
+		}
+	case strings.Count(s, ":") >= 2:
+		if ip := net.ParseIP(s); ip == nil || ip.To4() != nil {
+			return ""
+		}
+		host = s
+	default:
+		parts := strings.Split(s, ":")
+		if len(parts) > 2 {
+			return ""
+		}
+		host = parts[0]
+		if len(parts) == 2 {
+			port = parts[1]
+			if port == "" {
+				return ""
+			}
+		}
+		if !isDottedQuad(host) && !isDomainName(host) {
+			return ""
+		}
+	}
+	host = strings.ToLower(host)
+	if strings.Contains(host, ":") {
+		host = "[" + host + "]"
+	}
+	if port != "" {
+		if len(port) > 5 {
+			return ""
+		}
+		n, err := strconv.Atoi(port)
+		if err != nil || n < 1 || n > 65535 || strings.TrimLeft(port, "0123456789") != "" {
+			return ""
+		}
+		return host + ":" + strconv.Itoa(n)
+	}
+	return host
+}
+
+func isDottedQuad(host string) bool {
+	parts := strings.Split(host, ".")
+	if len(parts) != 4 {
+		return false
+	}
+	for _, p := range parts {
+		if len(p) < 1 || len(p) > 3 || strings.TrimLeft(p, "0123456789") != "" || (len(p) > 1 && p[0] == '0') {
+			return false
+		}
+		if n, _ := strconv.Atoi(p); n > 255 {
+			return false
+		}
+	}
+	return true
+}
+
+func isDomainName(host string) bool {
+	if host == "" || len(host) > 253 || strings.TrimLeft(host, "0123456789.") == "" {
+		return false
+	}
+	for _, label := range strings.Split(host, ".") {
+		if label == "" || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+			return false
+		}
+		for _, c := range label {
+			if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '-') {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+var po0TokenPattern = regexp.MustCompile(`^pgnfw_[A-Za-z0-9_-]{4,200}(@[0-9]{1,2})?$`)
+
+func isValidPo0Token(token string) bool { return po0TokenPattern.MatchString(strings.TrimSpace(token)) }
+
+func splitPo0Token(token string) (string, string) {
+	if i := strings.Index(token, "@"); i >= 0 {
+		return token[:i], token[i+1:]
+	}
+	return token, ""
+}
+
+// 上报地址：https://<地址>/api/firewall/<token 去掉 @槽位>/add[?slot=N]（与主控同一拼法）
+func po0ReportURL(address, token string) string {
+	address = normalizePo0Address(address)
+	if address == "" || !isValidPo0Token(token) {
+		return ""
+	}
+	secret, slot := splitPo0Token(strings.TrimSpace(token))
+	u := "https://" + address + "/api/firewall/" + secret + "/add"
+	if slot != "" {
+		u += "?slot=" + slot
+	}
+	return u
+}
+
+// 脱敏：pgnfw_•••• + 密钥最后 4 位（不足 8 位不露）+ 槽位
+func maskPo0Token(token string) string {
+	secret, slot := splitPo0Token(strings.TrimSpace(token))
+	body := strings.TrimPrefix(secret, "pgnfw_")
+	tail := ""
+	if len(body) >= 8 {
+		tail = body[len(body)-4:]
+	}
+	out := "pgnfw_••••" + tail
+	if slot != "" {
+		out += "@" + slot
+	}
+	return out
+}
+
+// ---------- 加密 RPC ----------
+
+func panelServerError(obj map[string]any, fallback string) error {
+	if msg, _ := obj["error"].(string); msg != "" {
+		return errors.New(msg)
+	}
+	return errors.New(fallback)
+}
+
+func panelRPC(base, path, method, token string, payload map[string]any) (map[string]any, error) {
+	raw, err := panelRPCRaw(base, path, method, token, payload)
+	if err != nil {
+		return nil, err
+	}
+	var obj map[string]any
+	if err := json.Unmarshal(raw, &obj); err != nil {
+		return nil, fmt.Errorf("主控应答无法解析：%v", err)
+	}
+	return obj, nil
+}
+
+// 一次加密 RPC：内层 JSON 带 path / method / token / ts / nonce（主控把 path 映射到 /api + path）。
+// 信封 = 临时公钥(32) ‖ nonce(12) ‖ 密文+tag；应答整体是 nonce(12) ‖ 密文+tag，成功和出错都是密文。
+func panelRPCRaw(base, path, method, token string, payload map[string]any) ([]byte, error) {
+	masterPub, err := panelMasterKey(base)
+	if err != nil {
+		return nil, err
+	}
+	inner := map[string]any{}
+	for k, v := range payload {
+		inner[k] = v
+	}
+	inner["path"] = path
+	inner["method"] = method
+	if token != "" {
+		inner["token"] = token
+	}
+	inner["ts"] = time.Now().Unix()
+	nonceID := make([]byte, 16)
+	_, _ = rand.Read(nonceID)
+	inner["nonce"] = hex.EncodeToString(nonceID)
+	plain, err := json.Marshal(inner)
+	if err != nil {
+		return nil, err
+	}
+
+	eph, err := ecdh.X25519().GenerateKey(rand.Reader)
+	if err != nil {
+		return nil, err
+	}
+	shared, err := eph.ECDH(masterPub)
+	if err != nil {
+		return nil, err
+	}
+	ePub := eph.PublicKey().Bytes()
+	salt := append(append([]byte{}, ePub...), masterPub.Bytes()...)
+	keyC2S := panelHKDF(shared, salt, "mmx-secure-rpc-c2s-v1")
+	keyS2C := panelHKDF(shared, salt, "mmx-secure-rpc-s2c-v1")
+
+	aead, err := chacha20poly1305.New(keyC2S)
+	if err != nil {
+		return nil, err
+	}
+	nonce := make([]byte, chacha20poly1305.NonceSize)
+	_, _ = rand.Read(nonce)
+	envelope := append(append(append([]byte{}, ePub...), nonce...), aead.Seal(nil, nonce, plain, nil)...)
+
+	req, err := http.NewRequest("POST", base+"/api/secure/rpc", bytes.NewReader(envelope))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/octet-stream")
+	resp, err := panelHTTP.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("连不上主控：%v", err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+	if err != nil {
+		return nil, err
+	}
+	respAEAD, err := chacha20poly1305.New(keyS2C)
+	if err != nil {
+		return nil, err
+	}
+	if len(body) < chacha20poly1305.NonceSize+respAEAD.Overhead() {
+		return nil, fmt.Errorf("主控应答无法解密（HTTP %d）", resp.StatusCode)
+	}
+	out, err := respAEAD.Open(nil, body[:chacha20poly1305.NonceSize], body[chacha20poly1305.NonceSize:], nil)
+	if err != nil {
+		return nil, fmt.Errorf("主控应答无法解密（HTTP %d）", resp.StatusCode)
+	}
+	return out, nil
+}
+
+func panelHKDF(secret, salt []byte, info string) []byte {
+	key := make([]byte, 32)
+	_, _ = io.ReadFull(hkdf.New(sha256.New, secret, salt, []byte(info)), key)
+	return key
+}
+
+// 取主控证书并用许可证公钥验签：域名必须与主控地址一致、没过期（同客户端 MasterCert.verified）
+func panelMasterKey(base string) (*ecdh.PublicKey, error) {
+	u, err := url.Parse(base)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := panelHTTP.Get(base + "/api/secure/cert")
+	if err != nil {
+		return nil, fmt.Errorf("连不上主控（%s）：%v", u.Host, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("主控证书端点返回 HTTP %d", resp.StatusCode)
+	}
+	var cert struct {
+		MasterPub  string `json:"masterPub"`
+		Domain     string `json:"domain"`
+		ExpireUnix int64  `json:"expireUnix"`
+		Sig        string `json:"sig"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<16)).Decode(&cert); err != nil {
+		return nil, errors.New("主控证书格式无法解析")
+	}
+	licenseKey, _ := base64.StdEncoding.DecodeString(panelLicenseKey)
+	sig, _ := base64.StdEncoding.DecodeString(cert.Sig)
+	msg := fmt.Sprintf("mmx-cert-v1\n%s\n%s\n%d", cert.MasterPub, cert.Domain, cert.ExpireUnix)
+	if cert.ExpireUnix <= time.Now().Unix() || !strings.EqualFold(cert.Domain, u.Hostname()) ||
+		!ed25519.Verify(ed25519.PublicKey(licenseKey), []byte(msg), sig) {
+		return nil, errors.New("主控证书验签失败（域名 / 有效期不符，或不是正版主控）")
+	}
+	raw, err := base64.StdEncoding.DecodeString(cert.MasterPub)
+	if err != nil {
+		return nil, errors.New("主控公钥无效")
+	}
+	return ecdh.X25519().NewPublicKey(raw)
+}
+
+// ---------- 状态文件 ----------
+
+func loadPanelState() (*panelState, error) {
+	data, err := os.ReadFile(panelStatePath)
+	if err != nil {
+		return nil, errors.New("还没有登录主控账户")
+	}
+	var st panelState
+	if err := json.Unmarshal(data, &st); err != nil || st.Base == "" || st.Token == "" {
+		return nil, errors.New("还没有登录主控账户")
+	}
+	return &st, nil
+}
+
+func (st *panelState) save() error {
+	data, err := json.Marshal(st)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(panelStatePath), 0o755); err != nil {
+		return err
+	}
+	tmp := panelStatePath + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, panelStatePath)
+}

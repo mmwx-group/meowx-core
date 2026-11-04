@@ -78,6 +78,11 @@ func init() {
 }
 
 func main() {
+	// MeowX OpenWrt 版的主控账户子命令（meowx_panel.go）。必须排在下面替换 net.DefaultResolver 之前：
+	// 那之后任何走默认解析器的 HTTP 请求都会直接 panic
+	if len(os.Args) > 1 && os.Args[1] == "panel" {
+		os.Exit(panelMain(os.Args[2:]))
+	}
 	executor.StandaloneInbound = true
 	// Defensive programming: panic when code mistakenly calls net.DefaultResolver
 	net.DefaultResolver.PreferGo = true

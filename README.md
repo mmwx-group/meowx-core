@@ -24,10 +24,12 @@ MeowX 各端共用的代理内核：[mihomo](https://github.com/MetaCubeX/mihomo
 
 tag 形如 `vX.Y.Z`，与各端的应用版本无关。发一个新内核：
 
-1. 在这里提交、打 tag 并推送；
-2. meowx-openwrt：把 `meowx-core/Makefile` 的 `PKG_VERSION` / `PKG_SOURCE_VERSION` 改到这个 tag，打 `core-vX.Y.Z` 发版——
-   只更新内核，路由器上「关于」页的「更新内核」即可升级，不动插件本身；
-3. meowC：在 `core/Clash.Meta` 子模块里切到这个 tag，提交子模块指针。
+1. 在这里提交、打 tag 并推送。`release` 工作流随即编出 OpenWrt 各架构的二进制（`meowx-core-linux-<架构>.gz`），
+   连同 `sha256sums.txt`、`version.txt` 发到 GitHub Release（已有的 tag 可在 Actions 里手动补发）；
+2. 路由器：meowx-openwrt「关于」页的「更新内核」直接从 Release 下载、校验后替换 `/usr/bin/meowx-core`，不动插件，
+   也不用等 meowx-openwrt 发版；
+3. meowx-openwrt 下次发插件时，把 `meowx-core/Makefile` 改到这个 tag（新装的路由器从软件源装到的内核）；
+4. meowC：在 `core/Clash.Meta` 子模块里切到这个 tag，提交子模块指针。
 
 ## 编译与测试
 

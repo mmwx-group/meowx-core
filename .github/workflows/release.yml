@@ -1,0 +1,64 @@
+name: release
+
+# 打 vX.Y.Z tag：编出 OpenWrt 路由器各架构的内核（与 meowx-openwrt 的 meowx-core 包同样的 tag 与版本号写法），
+# gzip 后连同 sha256sums.txt、version.txt 发到 GitHub Release。meowx-openwrt「关于」页的「更新内核」直接从这里下载：
+# releases/latest/download/version.txt 取最新版本，再按路由器架构取 meowx-core-linux-<架构>.gz 并校验 sha256。
+# 已有的 tag 可以手动触发补发（填 tag）。带 '-' 的 tag 发成预发布，latest 不会指向它。
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '要发的 tag（如 v0.4.7）'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ env.TAG }}
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.26.10'
+
+      - name: build
+        run: |
+          version="${TAG#v}"
+          tags=with_gvisor,no_easytier,no_tailscale,no_zerotier
+          ldflags="-s -w -buildid= -X github.com/metacubex/mihomo/constant.Version=meowx-${version} -X github.com/metacubex/mihomo/constant.BuildTime=$(git log -1 --format=%cI)"
+          mkdir -p dist
+          build() {
+            name="$1"; shift
+            env CGO_ENABLED=0 GOOS=linux "$@" go build -trimpath -tags "$tags" -ldflags "$ldflags" -o "dist/meowx-core-linux-$name" .
+            gzip -9 -n "dist/meowx-core-linux-$name"
+          }
+          # 名字与 meowx-openwrt 的 core_update.sh 里按 DISTRIB_ARCH 的对应关系一致，改这里要两边一起改
+          build amd64 GOARCH=amd64 GOAMD64=v1
+          build 386 GOARCH=386 GO386=softfloat
+          build arm64 GOARCH=arm64
+          build armv7 GOARCH=arm GOARM=7
+          build armv5 GOARCH=arm GOARM=5
+          build mips-softfloat GOARCH=mips GOMIPS=softfloat
+          build mipsle-softfloat GOARCH=mipsle GOMIPS=softfloat
+          build mips64-softfloat GOARCH=mips64 GOMIPS64=softfloat
+          build riscv64 GOARCH=riscv64
+          build loong64 GOARCH=loong64
+          cd dist
+          sha256sum meowx-core-linux-*.gz > sha256sums.txt
+          echo "$version" > version.txt
+          ls -l
+
+      - uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ env.TAG }}
+          files: dist/*
+          prerelease: ${{ contains(env.TAG, '-') }}

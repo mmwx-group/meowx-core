@@ -147,5 +147,9 @@ require (
 	golang.org/x/tools v0.24.0 // indirect
 )
 
+// TCP accept 循环遇到暂时性错误（如 fd 用尽）不再永久退出，见 third_party/sing-tun/README.md。
+// 只对直接在本仓库编译（OpenWrt 等独立程序）生效；meowC 把本仓库当依赖时要在它自己的 go.mod 里同样 replace。
+replace github.com/metacubex/sing-tun => ./third_party/sing-tun
+
 // for https://github.com/golang/protobuf/issues/1704
 replace google.golang.org/protobuf => github.com/metacubex/protobuf-go v0.0.0-20260306035419-7ceee0674686

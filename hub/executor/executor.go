@@ -103,6 +103,7 @@ func ApplyConfig(cfg *config.Config, force bool) {
 	updateUsers(cfg.Users)
 	updateProxies(cfg.Proxies, cfg.Providers)
 	updateRules(cfg.Rules, cfg.SubRules, cfg.RuleProviders)
+	updatePriorityRules(cfg.PriorityRules)
 	updateSniffer(cfg.Sniffer)
 	updateHosts(cfg.Hosts)
 	updateGeneral(cfg.General, true)
@@ -321,6 +322,11 @@ func updateProxies(proxies map[string]C.Proxy, providers map[string]P.ProxyProvi
 
 func updateRules(rules []C.Rule, subRules map[string][]C.Rule, ruleProviders map[string]P.RuleProvider) {
 	tunnel.UpdateRules(rules, subRules, ruleProviders)
+}
+
+// updatePriorityRules MeowX：先于出站模式匹配的规则（见 config.RawConfig.PriorityRule）
+func updatePriorityRules(rules []C.Rule) {
+	tunnel.UpdatePriorityRules(rules)
 }
 
 func loadProvider[T P.Provider](providers map[string]T) {

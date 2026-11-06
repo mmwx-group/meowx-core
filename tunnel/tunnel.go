@@ -409,6 +409,11 @@ func resolveMetadata(metadata *C.Metadata) (proxy C.Proxy, rule C.Rule, err erro
 		helper.FindProcess = nil
 	}
 
+	// MeowX：先于出站模式的规则（priority-rules，见 priority_rules.go），没配置时不进循环
+	if p, r := matchPriority(metadata, helper); p != nil {
+		return p, r, nil
+	}
+
 	switch mode {
 	case Direct:
 		proxy = proxies["DIRECT"]

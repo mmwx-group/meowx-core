@@ -49,6 +49,7 @@ type Tailscale struct {
 	serverStarted bool
 
 	unregisterDNSResolver func()
+	unregisterStatus      func() // MeowX：按名字取状态（见 tailscale_status.go）
 }
 
 type TailscaleOption struct {
@@ -180,6 +181,7 @@ func NewTailscale(option TailscaleOption) (*Tailscale, error) {
 	dnsTransport := tailscaleDNSTransport{tailscale: outbound}
 	outbound.dnsResolver = dns.NewResolverFromClient(dnsTransport)
 	outbound.unregisterDNSResolver = dns.RegisterTailscaleDnsClient(option.Name, dnsTransport)
+	outbound.unregisterStatus = registerTailscaleOutbound(option.Name, outbound)
 	return outbound, nil
 }
 
@@ -468,6 +470,9 @@ func (t *Tailscale) Close() error {
 	t.cancel()
 	if t.unregisterDNSResolver != nil {
 		t.unregisterDNSResolver()
+	}
+	if t.unregisterStatus != nil {
+		t.unregisterStatus()
 	}
 	t.startOnce.Do(func() {
 		t.startErr = errors.New("tailscale outbound closed")

@@ -203,6 +203,7 @@ type Config struct {
 	Profile       *Profile
 	Rules         []C.Rule
 	SubRules      map[string][]C.Rule
+	PriorityRules []C.Rule // MeowX：先于出站模式匹配的规则（见 RawConfig.PriorityRule）
 	Users         []auth.AuthUser
 	Proxies       map[string]C.Proxy
 	Listeners     map[string]C.InboundListener
@@ -469,6 +470,10 @@ type RawConfig struct {
 	TLS           RawTLS                    `yaml:"tls" json:"tls"`
 
 	ClashForAndroid RawClashForAndroid `yaml:"clash-for-android" json:"clash-for-android"`
+
+	// MeowX：先于出站模式匹配的规则，写法同 rules。规则 / 全局 / 直连三种模式下都先查它，命中就用它的出站，
+	// 没命中照旧按模式走（客户端把组网的地址段放这里，全局 / 直连下也能访问）。不写时行为不变
+	PriorityRule []string `yaml:"priority-rules" json:"priority-rules,omitempty"`
 }
 
 // Parse config
@@ -707,6 +712,14 @@ func ParseRawConfig(rawCfg *RawConfig) (*Config, error) {
 		return nil, err
 	}
 	config.Rules = rules
+
+	if len(rawCfg.PriorityRule) > 0 {
+		priorityRules, err := parseRules(rawCfg.PriorityRule, proxies, ruleProviders, subRules, "priority-rules")
+		if err != nil {
+			return nil, err
+		}
+		config.PriorityRules = priorityRules
+	}
 
 	hosts, err := parseHosts(rawCfg)
 	if err != nil {

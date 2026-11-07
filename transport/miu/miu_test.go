@@ -926,14 +926,36 @@ func TestStreamAbortTimeout(t *testing.T) {
 	}
 
 	// a write under way cannot be cut short without leaving the lane out of
-	// step: that lane goes with the stream
+	// step, but one that lets go soon (the timer sending OPEN alone, a Write the
+	// scheduler is slow to get back to) is waited for: the lane is kept
 	stream = testOpen(t, c, echoDst)
 	testEcho(t, stream, []byte("hello"))
+	l = stream.lane()
+	stream.wmu.Lock()
+	start = time.Now()
+	stream.Close()
+	if d := time.Since(start); d > closeGrace/2 {
+		t.Fatalf("Close waited %v for the write", d)
+	}
+	time.Sleep(closeGrace / 4)
+	stream.wmu.Unlock()
+	testWait(t, "the lane to go back", func() bool { return len(c.idleLanes()) == 1 })
+	if l.closed.Load() || s.resets.Load() != 2 {
+		t.Fatalf("a write that let go in time should not cost the lane: resets=%d", s.resets.Load())
+	}
+
+	// one still stuck after closeGrace: that lane goes with the stream
+	stream = testOpen(t, c, echoDst)
+	testEcho(t, stream, []byte("hello"))
+	if stream.lane() != l {
+		t.Fatal("the lane was not reused")
+	}
 	stream.wmu.Lock()
 	stream.Close()
+	testWait(t, "the lane to be given up", func() bool { return l.closed.Load() })
 	stream.wmu.Unlock()
-	if !stream.lane().closed.Load() || s.resets.Load() != 1 {
-		t.Fatal("Close in the middle of a write should close the lane")
+	if s.resets.Load() != 2 {
+		t.Fatalf("resets=%d", s.resets.Load())
 	}
 
 	// the lane died under the stream: nothing to keep
@@ -941,7 +963,7 @@ func TestStreamAbortTimeout(t *testing.T) {
 	if _, err := stream.Write([]byte("x")); err != nil {
 		t.Fatal(err)
 	}
-	testWait(t, "the stream to be opened", func() bool { return s.opens.Load() == 3 })
+	testWait(t, "the stream to be opened", func() bool { return s.opens.Load() == 4 })
 	s.closeConns()
 	stream.Close()
 	l = stream.lane()
@@ -1835,6 +1857,10 @@ func TestRawSegments(t *testing.T) {
 			if k, err := stream.Read(make([]byte, 1)); k != 0 || err != io.EOF {
 				t.Fatalf("END: %d %v", k, err)
 			}
+			// the large Write above runs in a goroutine of its own and counts its
+			// last segment once the write returned, which may be after the server
+			// read it: wait for that instead of racing it
+			testWait(t, "the raw segments to be counted", func() bool { return events.count("raw:out") == 3 })
 			if events.count("raw:in") != 3 || events.count("raw:out") != 3 {
 				t.Fatalf("raw segments: in=%d out=%d", events.count("raw:in"), events.count("raw:out"))
 			}

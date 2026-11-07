@@ -304,8 +304,27 @@ func ggyUCI(args ...string) (string, error) {
 	return strings.TrimSpace(string(out)), err
 }
 
+// 没有 uci 的外壳（飞牛 NAS 版）：开关与 token 列表存这个 JSON 文件（MEOWX_GGY_STATE）
+type ggyFileState struct {
+	Enabled bool     `json:"enabled"`
+	Tokens  []string `json:"tokens"`
+}
+
 func loadGGYConfig() ggyConfig {
 	var cfg ggyConfig
+	if path := os.Getenv("MEOWX_GGY_STATE"); path != "" {
+		var st ggyFileState
+		if data, err := os.ReadFile(path); err == nil {
+			_ = json.Unmarshal(data, &st)
+		}
+		cfg.Enabled = st.Enabled
+		for _, t := range st.Tokens {
+			if ggyTokenPattern.MatchString(t) && !ggyContains(cfg.Tokens, t) {
+				cfg.Tokens = append(cfg.Tokens, t)
+			}
+		}
+		return cfg
+	}
 	switch v, _ := ggyUCI("get", "meowx.ggy.enabled"); v {
 	case "1", "true", "yes", "on":
 		cfg.Enabled = true
@@ -322,6 +341,20 @@ func loadGGYConfig() ggyConfig {
 }
 
 func (cfg ggyConfig) save() error {
+	if path := os.Getenv("MEOWX_GGY_STATE"); path != "" {
+		data, err := json.Marshal(ggyFileState{Enabled: cfg.Enabled, Tokens: cfg.Tokens})
+		if err != nil {
+			return err
+		}
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			return err
+		}
+		tmp := path + ".tmp"
+		if err := os.WriteFile(tmp, data, 0o600); err != nil {
+			return err
+		}
+		return os.Rename(tmp, path)
+	}
 	enabled := "0"
 	if cfg.Enabled {
 		enabled = "1"

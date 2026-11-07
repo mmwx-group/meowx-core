@@ -7,6 +7,7 @@ package main
 //	meowx-core panel status | profile | subscriptions | firewall | report | logout
 //	meowx-core panel po0 status | enable | disable | fetch | add <地址> <token> | remove <序号>
 //	meowx-core panel ggy status | enable | disable | add <token 或分享链接> | remove <序号> | report（meowx_ggy.go）
+//	meowx-core panel mesh status | sites … | enroll … | devices | delete …（喵窝，meowx_mesh.go）
 //
 // 加密信道与 iOS / Android 客户端同一套（主控 /api/secure/cert + /api/secure/rpc）：许可证服务用 Ed25519 签发的主控证书
 // → 每次请求一把临时 X25519 密钥 + HKDF-SHA256 派生收发两把 key → ChaCha20-Poly1305。
@@ -144,7 +145,7 @@ func panelMain(args []string) int {
 	}
 	panelBypassProxy()
 	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "usage: meowx-core panel login <link> | status | profile | subscriptions | firewall | report | logout | po0 … | ggy …")
+		fmt.Fprintln(os.Stderr, "usage: meowx-core panel login <link> | status | profile | subscriptions | firewall | report | logout | po0 … | ggy … | mesh …")
 		return 2
 	}
 	var out any
@@ -170,6 +171,8 @@ func panelMain(args []string) int {
 		out, err = po0Main(args[1:])
 	case "ggy":
 		out, err = ggyMain(args[1:])
+	case "mesh":
+		out, err = meshMain(args[1:])
 	case "logout":
 		err = os.Remove(panelStatePath)
 		if errors.Is(err, os.ErrNotExist) {

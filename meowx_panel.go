@@ -301,6 +301,12 @@ func panelSubscriptions() (any, error) {
 	if obj, err := panelRPC(st.Base, "/user/token", "GET", st.Token, nil); err == nil {
 		subToken, _ = obj["token"].(string)
 	}
+	// 订阅链接挂在主控「订阅地址」（订阅域名）上，没配才用登录的主控地址
+	subBase := st.Base
+	if obj, err := panelRPC(st.Base, "/user/config", "GET", st.Token, nil); err == nil {
+		raw, _ := obj["subscription_url"].(string)
+		subBase = panelSubscriptionBase(raw, st.Base)
+	}
 	raw, err := panelRPCRaw(st.Base, "/subscriptions", "GET", st.Token, nil)
 	if err != nil {
 		return nil, err
@@ -337,28 +343,7 @@ func panelSubscriptions() (any, error) {
 		if name == "" {
 			name = filename
 		}
-		// subscription_path 只有是短链（/x/{code}）时才自带凭证；主控关掉短链接（或这份订阅没有短码）时给的是
-		// /api/clash/subscribe?filename=…、/api/user/package-subscribe?assignment_id=… / ?merged=1，要补 token=<订阅令牌>
-		// （主控网页 buildSubscriptionURL 同样这么拼）。不补的话主控按令牌无效回「订阅已过期」的占位配置（同客户端的修复）
-		link := ""
-		if path != "" {
-			if u, err := url.Parse(st.Base); err == nil {
-				if p, err := url.Parse(path); err == nil {
-					full := u.ResolveReference(p)
-					q := full.Query()
-					if !strings.HasPrefix(full.Path, "/x/") && q.Get("token") == "" {
-						if subToken == "" {
-							continue
-						}
-						q.Set("token", subToken)
-						full.RawQuery = q.Encode()
-					}
-					link = full.String()
-				}
-			}
-		} else if subToken != "" && filename != "" {
-			link = st.Base + "/api/clash/subscribe?" + url.Values{"token": {subToken}, "filename": {filename}, "t": {"clash"}}.Encode()
-		}
+		link := panelSubscriptionLink(subBase, path, filename, subToken)
 		if link == "" {
 			continue
 		}
@@ -371,6 +356,56 @@ func panelSubscriptions() (any, error) {
 		list = append(list, entry)
 	}
 	return map[string]any{"success": true, "base": st.Base, "subscriptions": list}, nil
+}
+
+// panelSubscriptionBase 订阅链接用的主机：主控「订阅地址」（/api/user/config 的 subscription_url，可能不带 scheme），
+// 没配或写得不对用 fallback（登录的主控地址）。主控网页给用户复制的订阅链接就是这样拼的（useSubscriptionBaseURL）；
+// 以前一律用登录的主控地址，配了订阅域名、而主控域名上拉不到订阅时，导入账户订阅报 HTTP 404，
+// 网页上复制的链接手动粘贴却能用（飞牛 NAS 版 #1716）。只取 scheme + 主机（含端口），同网页 new URL(path, base)。
+func panelSubscriptionBase(raw, fallback string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return fallback
+	}
+	if !strings.Contains(raw, "://") {
+		raw = "https://" + raw
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" || (u.Scheme != "https" && u.Scheme != "http") {
+		return fallback
+	}
+	return u.Scheme + "://" + u.Host
+}
+
+// panelSubscriptionLink 一份账户订阅的导入地址；拼不出来（缺订阅令牌）回空。
+// subscription_path 只有是短链（/x/{code}）时才自带凭证；主控关掉短链接（或这份订阅没有短码）时给的是
+// /api/clash/subscribe?filename=…、/api/user/package-subscribe?assignment_id=… / ?merged=1，要补 token=<订阅令牌>
+// （主控网页 buildSubscriptionURL 同样这么拼）。不补的话主控按令牌无效回「订阅已过期」的占位配置（同客户端的修复）
+func panelSubscriptionLink(base, path, filename, subToken string) string {
+	if path != "" {
+		u, err := url.Parse(base)
+		if err != nil {
+			return ""
+		}
+		p, err := url.Parse(path)
+		if err != nil {
+			return ""
+		}
+		full := u.ResolveReference(p)
+		q := full.Query()
+		if !strings.HasPrefix(full.Path, "/x/") && q.Get("token") == "" {
+			if subToken == "" {
+				return ""
+			}
+			q.Set("token", subToken)
+			full.RawQuery = q.Encode()
+		}
+		return full.String()
+	}
+	if subToken != "" && filename != "" {
+		return base + "/api/clash/subscribe?" + url.Values{"token": {subToken}, "filename": {filename}, "t": {"clash"}}.Encode()
+	}
+	return ""
 }
 
 // ---------- 客户端 IP 白名单 ----------

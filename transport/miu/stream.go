@@ -345,6 +345,11 @@ func (s *Stream) Read(p []byte) (int, error) {
 	s.rmu.Lock()
 	defer s.rmu.Unlock()
 	for {
+		if s.closed.Load() {
+			// Close came in while this read was under way, even when the stream
+			// ran to its end meanwhile: whoever settles the stream goes on from here
+			return 0, io.ErrClosedPipe
+		}
 		if s.eof {
 			return 0, io.EOF
 		}
@@ -355,16 +360,16 @@ func (s *Stream) Read(p []byte) (int, error) {
 			return 0, nil
 		}
 		n, err := s.readLane(s.rl, p)
+		if s.closed.Load() {
+			// Close had this read return, or came in just as it got something:
+			// either way it is for nobody now
+			return 0, io.ErrClosedPipe
+		}
 		if err == nil {
 			if n > 0 {
 				return n, nil
 			}
 			continue
-		}
-		if s.closed.Load() {
-			// Close had this read return, whoever settles the stream goes on
-			// from here
-			return 0, io.ErrClosedPipe
 		}
 		if isTimeout(err) {
 			return 0, err // what is read so far of a frame stays, the next Read goes on
@@ -581,10 +586,34 @@ func (s *Stream) Close() error {
 	}
 	if !s.wmu.TryLock() {
 		// A write is under way. It cannot be cut short without leaving the lane
-		// out of step, so the lane goes with it.
-		l.close()
+		// out of step, but mostly it is through already and about to let go (the
+		// timer that sends OPEN alone, a Write the scheduler has not got back to
+		// on a busy machine): wait for it in the background, and give the lane up
+		// only when it is still stuck after closeGrace.
+		go func() {
+			if !lockWithin(&s.wmu, closeGrace) {
+				l.close()
+				return
+			}
+			s.smu.Lock()
+			done := s.done
+			s.smu.Unlock()
+			if done {
+				// that write ran the stream to its end: the lane is back already
+				s.wmu.Unlock()
+				return
+			}
+			s.abort(l)
+		}()
 		return nil
 	}
+	s.abort(l)
+	return nil
+}
+
+// abort ends the uplink of a closed stream and takes the lane to where it can
+// carry another one, or closes it. wmu must be held, it is let go here.
+func (s *Stream) abort(l *lane) {
 	last, err := s.endUplink(l)
 	s.wmu.Unlock()
 	switch {
@@ -602,7 +631,18 @@ func (s *Stream) Close() error {
 			s.rmu.Unlock()
 		}()
 	}
-	return nil
+}
+
+// lockWithin locks mu if that can be done within d.
+func lockWithin(mu *sync.Mutex, d time.Duration) bool {
+	deadline := time.Now().Add(d)
+	for !mu.TryLock() {
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(time.Millisecond)
+	}
+	return true
 }
 
 // endUplink ends the uplink of a closed stream and tells with what: nothing when

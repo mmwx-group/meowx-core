@@ -460,6 +460,8 @@ func panelReport() (any, error) {
 			results = append(results, reportTarget("po0", u, true)...)
 		}
 	}
+	// 主控与 po0 的结果写进插件日志（GGY / AkileCDN 各自写）：以前一行不记，加白时好时坏查不出是哪一环（#1779）
+	ggyLog(reportLogLines(results))
 	if ggy := loadGGYConfig(); ggy.Enabled && len(ggy.Tokens) > 0 {
 		results = append(results, ggyReport(ggy.Tokens)...)
 	}
@@ -491,7 +493,7 @@ func reportTarget(kind, target string, po0 bool) []map[string]any {
 		status, err := reportOnce(target, family, po0)
 		switch {
 		case err != nil:
-			res["ok"], res["error"] = false, err.Error()
+			res["ok"], res["error"] = false, reportErrorText(err)
 		case status == http.StatusOK:
 			res["ok"] = true
 		case status == http.StatusForbidden && po0:
@@ -502,6 +504,67 @@ func reportTarget(kind, target string, po0 bool) []map[string]any {
 		out = append(out, res)
 	}
 	return out
+}
+
+// http.Client 的错误是 `Post "<地址>": <原因>`，上报地址里带着完整 token（主控 /api/fw/<token>/add、po0 /api/firewall/<token>/add）：
+// 只留原因，这段文字会进日志与界面
+func reportErrorText(err error) string {
+	var ue *url.Error
+	if errors.As(err, &ue) && ue.Err != nil {
+		return ue.Err.Error()
+	}
+	return err.Error()
+}
+
+// 每台目标一行（同 GGY 的写法）：IPv4 / IPv6 有一发成功就算成功——只有 IPv4 的网络里 IPv6 那发失败不算错，
+// 不然每 10 分钟记一行假失败；都失败才写原因
+func reportLogLines(results []map[string]any) []string {
+	type target struct {
+		kind, host string
+		ok         []string
+		errs       []string
+	}
+	var order []*target
+	byKey := map[string]*target{}
+	for _, r := range results {
+		kind, _ := r["kind"].(string)
+		if kind != "panel" && kind != "po0" {
+			continue
+		}
+		host, _ := r["host"].(string)
+		t := byKey[kind+"|"+host]
+		if t == nil {
+			t = &target{kind: kind, host: host}
+			byKey[kind+"|"+host] = t
+			order = append(order, t)
+		}
+		family := "IPv4"
+		if f, _ := r["family"].(string); f == "tcp6" {
+			family = "IPv6"
+		}
+		if ok, _ := r["ok"].(bool); ok {
+			t.ok = append(t.ok, family)
+		} else {
+			e, _ := r["error"].(string)
+			if e == "" {
+				e = "未知错误"
+			}
+			t.errs = append(t.errs, family+" "+e)
+		}
+	}
+	lines := make([]string, 0, len(order))
+	for _, t := range order {
+		name := "主控白名单 " + t.host
+		if t.kind == "po0" {
+			name = "po0 加白 " + t.host
+		}
+		if len(t.ok) > 0 {
+			lines = append(lines, name+"：成功（"+strings.Join(t.ok, "、")+"）")
+		} else {
+			lines = append(lines, name+"：失败（"+strings.Join(t.errs, "；")+"）")
+		}
+	}
+	return lines
 }
 
 func reportOnce(target, family string, po0 bool) (int, error) {

@@ -704,14 +704,17 @@ func po0Main(args []string) (any, error) {
 		if !isValidPo0Token(token) {
 			return nil, errors.New("token 不合法：应为 pgnfw_ 开头")
 		}
-		replaced := false
-		for i, c := range po.Custom {
-			if c.Address == address {
-				po.Custom[i].Token = token // 同一地址再加一次 = 换 token
-				replaced = true
+		// 只有「地址 + token 都一样」才算重复、不重复加；同一地址不同 token 要保留成另一条。
+		// po0 的加白地址可能相同而 token 不同（几份套餐共用一台 po0），得用不同 token 各报一次；
+		// reportURLs() 按含 token 的完整上报 URL 去重，两条都会报。以前只按地址去重、把 token 换掉，少报了。
+		exists := false
+		for _, c := range po.Custom {
+			if c.Address == address && c.Token == token {
+				exists = true
+				break
 			}
 		}
-		if !replaced {
+		if !exists {
 			if len(po.Custom) >= 16 {
 				return nil, errors.New("最多 16 台") // 同客户端 UserOverridesStore.maxEntries
 			}

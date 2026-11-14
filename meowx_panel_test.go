@@ -1,12 +1,13 @@
 package main
 
 // 账户订阅导入地址的单元测试。跑法同 meowx_ggy_test.go（main.go 的 init 里就 flag.Parse）：
-// go test -c -tags with_gvisor -o meowx.test . && ./meowx.test -test.run Panel
+// go test -c -tags with_gvisor -o meowx.test . && ./meowx.test（不带参数，跑全部）
 
 import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -105,5 +106,22 @@ func TestPanelReportTargetHidesToken(t *testing.T) {
 		if strings.Contains(line, token) {
 			t.Fatalf("日志带出了 token：%q", line)
 		}
+	}
+}
+
+// 测速榜上传凭证：payload_hash 不对、没登录都直接报错（外壳据此退回匿名上传），不去连主控
+func TestPanelSpeedTestGrantRejects(t *testing.T) {
+	saved := panelStatePath
+	defer func() { panelStatePath = saved }()
+	panelStatePath = filepath.Join(t.TempDir(), "panel.json")
+
+	for _, hash := range []string{"", "abc", strings.Repeat("g", 64), strings.Repeat("a", 63), strings.Repeat("a", 65)} {
+		if _, err := panelSpeedTestGrant(hash); err == nil || err.Error() != "payload_hash 无效" {
+			t.Errorf("hash %q: err = %v", hash, err)
+		}
+	}
+	// 大写与首尾空白规整之后合法，但没登录
+	if _, err := panelSpeedTestGrant(" " + strings.Repeat("AB", 32) + "\n"); err == nil || err.Error() != "还没有登录主控账户" {
+		t.Errorf("not logged in: err = %v", err)
 	}
 }

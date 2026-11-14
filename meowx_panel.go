@@ -10,6 +10,7 @@ package main
 //	meowx-core panel akile status | enable | disable | setkey … | clearkey | nodes … | rules … | add … | remove … | report [--timer]
 //	                                                       （AkileCDN 白名单，meowx_akile.go）
 //	meowx-core panel mesh status | sites … | enroll … | devices | delete …（喵窝，meowx_mesh.go）
+//	meowx-core panel speedtest-grant <payload_hash>（测速榜上传凭证，外壳的测速页上传前要）
 //
 // 加密信道与 iOS / Android 客户端同一套（主控 /api/secure/cert + /api/secure/rpc）：许可证服务用 Ed25519 签发的主控证书
 // → 每次请求一把临时 X25519 密钥 + HKDF-SHA256 派生收发两把 key → ChaCha20-Poly1305。
@@ -153,7 +154,7 @@ func panelMain(args []string) int {
 	}
 	panelBypassProxy()
 	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "usage: meowx-core panel login <link> | status | profile | subscriptions | firewall | report | logout | po0 … | ggy … | akile … | mesh …")
+		fmt.Fprintln(os.Stderr, "usage: meowx-core panel login <link> | status | profile | subscriptions | firewall | report | logout | po0 … | ggy … | akile … | mesh … | speedtest-grant <payload_hash>")
 		return 2
 	}
 	var out any
@@ -183,6 +184,12 @@ func panelMain(args []string) int {
 		out, err = akileMain(args[1:])
 	case "mesh":
 		out, err = meshMain(args[1:])
+	case "speedtest-grant":
+		if len(args) < 2 {
+			err = errors.New("missing payload_hash")
+		} else {
+			out, err = panelSpeedTestGrant(args[1])
+		}
 	case "logout":
 		err = os.Remove(panelStatePath)
 		if errors.Is(err, os.ErrNotExist) {
@@ -297,6 +304,37 @@ func panelProfile() (any, error) {
 		return nil, err
 	}
 	return map[string]any{"success": true, "username": st.Username, "avatar": st.Avatar}, nil
+}
+
+// ---------- 测速榜上传凭证 ----------
+
+var speedTestHashPattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
+
+// 测速榜上传凭证（规格 miaomiaowuC/Design/speedtest-board.md §4，同客户端 speedTestGrant）：主控代已登录用户向许可证服务要一张
+// 绑定 payload_hash（上传正文字节的 sha256）的一次性凭证，5 分钟有效；带着它上传的结果归到这个主控的许可证名下。
+// 外壳的测速页拿不到就匿名上传——没登录、主控旧、没许可证、限流、连不上都一样，不打扰用户。
+func panelSpeedTestGrant(hash string) (any, error) {
+	hash = strings.ToLower(strings.TrimSpace(hash))
+	if !speedTestHashPattern.MatchString(hash) {
+		return nil, errors.New("payload_hash 无效")
+	}
+	st, err := loadPanelState()
+	if err != nil {
+		return nil, err
+	}
+	obj, err := panelRPC(st.Base, "/user/speedtest/grant", "POST", st.Token, map[string]any{"payload_hash": hash})
+	if err != nil {
+		return nil, err
+	}
+	grant, _ := obj["grant"].(string)
+	if ok, _ := obj["success"].(bool); !ok || grant == "" {
+		return nil, panelServerError(obj, "主控没有给出上传凭证")
+	}
+	out := map[string]any{"success": true, "grant": grant}
+	if exp, _ := obj["expires_at"].(string); exp != "" {
+		out["expires_at"] = exp
+	}
+	return out, nil
 }
 
 // ---------- 账户订阅 ----------

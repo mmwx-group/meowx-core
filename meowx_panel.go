@@ -11,6 +11,7 @@ package main
 //	                                                       （AkileCDN 白名单，meowx_akile.go）
 //	meowx-core panel mesh status | sites … | enroll … | devices | delete …（喵窝，meowx_mesh.go）
 //	meowx-core panel speedtest-grant <payload_hash>（测速榜上传凭证，外壳的测速页上传前要）
+//	meowx-core panel realtime-config（打印 {"base","token"}，外壳原样 PUT 给内核的 /meowx/realtime 接上实时通道）
 //
 // 加密信道与 iOS / Android 客户端同一套（主控 /api/secure/cert + /api/secure/rpc）：许可证服务用 Ed25519 签发的主控证书
 // → 每次请求一把临时 X25519 密钥 + HKDF-SHA256 派生收发两把 key → ChaCha20-Poly1305。
@@ -20,11 +21,8 @@ import (
 	"bytes"
 	"context"
 	"crypto/ecdh"
-	"crypto/ed25519"
 	"crypto/rand"
-	"crypto/sha256"
 	"crypto/tls"
-	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -40,12 +38,8 @@ import (
 	"strings"
 	"time"
 
-	"golang.org/x/crypto/chacha20poly1305"
-	"golang.org/x/crypto/hkdf"
+	"github.com/metacubex/mihomo/component/panelsecure"
 )
-
-// 许可证服务的 Ed25519 验签公钥（与客户端内置的同一把）。
-const panelLicenseKey = "/cKXW8AIOPE6ChoZtXjP8N+KkIYvKLvnpLyaLPrpTQM="
 
 var panelStatePath = "/etc/meowx/panel.json"
 
@@ -154,7 +148,7 @@ func panelMain(args []string) int {
 	}
 	panelBypassProxy()
 	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "usage: meowx-core panel login <link> | status | profile | subscriptions | firewall | report | logout | po0 … | ggy … | akile … | mesh … | speedtest-grant <payload_hash>")
+		fmt.Fprintln(os.Stderr, "usage: meowx-core panel login <link> | status | profile | subscriptions | firewall | report | logout | po0 … | ggy … | akile … | mesh … | speedtest-grant <payload_hash> | realtime-config")
 		return 2
 	}
 	var out any
@@ -190,6 +184,8 @@ func panelMain(args []string) int {
 		} else {
 			out, err = panelSpeedTestGrant(args[1])
 		}
+	case "realtime-config":
+		out, err = panelRealtimeConfig()
 	case "logout":
 		err = os.Remove(panelStatePath)
 		if errors.Is(err, os.ErrNotExist) {
@@ -335,6 +331,19 @@ func panelSpeedTestGrant(hash string) (any, error) {
 		out["expires_at"] = exp
 	}
 	return out, nil
+}
+
+// ---------- 实时通道 ----------
+
+// panelRealtimeConfig 给外壳接实时通道用（规格 miaomiaowuC/Design/entry-realtime.md §7）：只打印 {"base","token"}，
+// 外壳原样 PUT 给内核的 /meowx/realtime（内核自己取证书验签、连 /api/secure/ws）。token 只走标准输出，不写日志。
+// 没登录时同别的子命令回 {"success":false,"error":…}、退出码 1。
+func panelRealtimeConfig() (any, error) {
+	st, err := loadPanelState()
+	if err != nil {
+		return nil, err
+	}
+	return map[string]any{"base": st.Base, "token": st.Token}, nil
 }
 
 // ---------- 账户订阅 ----------
@@ -985,6 +994,7 @@ func panelRPC(base, path, method, token string, payload map[string]any) (map[str
 
 // 一次加密 RPC：内层 JSON 带 path / method / token / ts / nonce（主控把 path 映射到 /api + path）。
 // 信封 = 临时公钥(32) ‖ nonce(12) ‖ 密文+tag；应答整体是 nonce(12) ‖ 密文+tag，成功和出错都是密文。
+// 加解密与客户端、内核的实时通道同一套（component/panelsecure）。
 func panelRPCRaw(base, path, method, token string, payload map[string]any) ([]byte, error) {
 	masterPub, err := panelMasterKey(base)
 	if err != nil {
@@ -1008,27 +1018,10 @@ func panelRPCRaw(base, path, method, token string, payload map[string]any) ([]by
 		return nil, err
 	}
 
-	eph, err := ecdh.X25519().GenerateKey(rand.Reader)
+	envelope, keyS2C, err := panelsecure.SealRPC(masterPub, plain)
 	if err != nil {
 		return nil, err
 	}
-	shared, err := eph.ECDH(masterPub)
-	if err != nil {
-		return nil, err
-	}
-	ePub := eph.PublicKey().Bytes()
-	salt := append(append([]byte{}, ePub...), masterPub.Bytes()...)
-	keyC2S := panelHKDF(shared, salt, "mmx-secure-rpc-c2s-v1")
-	keyS2C := panelHKDF(shared, salt, "mmx-secure-rpc-s2c-v1")
-
-	aead, err := chacha20poly1305.New(keyC2S)
-	if err != nil {
-		return nil, err
-	}
-	nonce := make([]byte, chacha20poly1305.NonceSize)
-	_, _ = rand.Read(nonce)
-	envelope := append(append(append([]byte{}, ePub...), nonce...), aead.Seal(nil, nonce, plain, nil)...)
-
 	req, err := http.NewRequest("POST", base+"/api/secure/rpc", bytes.NewReader(envelope))
 	if err != nil {
 		return nil, err
@@ -1043,61 +1036,16 @@ func panelRPCRaw(base, path, method, token string, payload map[string]any) ([]by
 	if err != nil {
 		return nil, err
 	}
-	respAEAD, err := chacha20poly1305.New(keyS2C)
-	if err != nil {
-		return nil, err
-	}
-	if len(body) < chacha20poly1305.NonceSize+respAEAD.Overhead() {
-		return nil, fmt.Errorf("主控应答无法解密（HTTP %d）", resp.StatusCode)
-	}
-	out, err := respAEAD.Open(nil, body[:chacha20poly1305.NonceSize], body[chacha20poly1305.NonceSize:], nil)
+	out, err := panelsecure.OpenRPC(keyS2C, body)
 	if err != nil {
 		return nil, fmt.Errorf("主控应答无法解密（HTTP %d）", resp.StatusCode)
 	}
 	return out, nil
 }
 
-func panelHKDF(secret, salt []byte, info string) []byte {
-	key := make([]byte, 32)
-	_, _ = io.ReadFull(hkdf.New(sha256.New, secret, salt, []byte(info)), key)
-	return key
-}
-
 // 取主控证书并用许可证公钥验签：域名必须与主控地址一致、没过期（同客户端 MasterCert.verified）
 func panelMasterKey(base string) (*ecdh.PublicKey, error) {
-	u, err := url.Parse(base)
-	if err != nil {
-		return nil, err
-	}
-	resp, err := panelHTTP.Get(base + "/api/secure/cert")
-	if err != nil {
-		return nil, fmt.Errorf("连不上主控（%s）：%v", u.Host, err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("主控证书端点返回 HTTP %d", resp.StatusCode)
-	}
-	var cert struct {
-		MasterPub  string `json:"masterPub"`
-		Domain     string `json:"domain"`
-		ExpireUnix int64  `json:"expireUnix"`
-		Sig        string `json:"sig"`
-	}
-	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<16)).Decode(&cert); err != nil {
-		return nil, errors.New("主控证书格式无法解析")
-	}
-	licenseKey, _ := base64.StdEncoding.DecodeString(panelLicenseKey)
-	sig, _ := base64.StdEncoding.DecodeString(cert.Sig)
-	msg := fmt.Sprintf("mmx-cert-v1\n%s\n%s\n%d", cert.MasterPub, cert.Domain, cert.ExpireUnix)
-	if cert.ExpireUnix <= time.Now().Unix() || !strings.EqualFold(cert.Domain, u.Hostname()) ||
-		!ed25519.Verify(ed25519.PublicKey(licenseKey), []byte(msg), sig) {
-		return nil, errors.New("主控证书验签失败（域名 / 有效期不符，或不是正版主控）")
-	}
-	raw, err := base64.StdEncoding.DecodeString(cert.MasterPub)
-	if err != nil {
-		return nil, errors.New("主控公钥无效")
-	}
-	return ecdh.X25519().NewPublicKey(raw)
+	return panelsecure.FetchMasterKey(panelHTTP, base)
 }
 
 // ---------- 状态文件 ----------

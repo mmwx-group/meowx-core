@@ -63,6 +63,14 @@ type mieruDNSResolver struct {
 var _ mierucommon.DNSResolver = (*mieruDNSResolver)(nil)
 
 func (dr mieruDNSResolver) LookupIP(ctx context.Context, network, host string) (_ []net.IP, err error) {
+	// MeowX：节点 server 在入口覆盖表里（主控指定的转发入口）时直接用表里的 IP
+	if ips := entryOverrideIPs(host, dr.prefer); len(ips) > 0 {
+		out := make([]net.IP, 0, len(ips))
+		for _, ip := range ips {
+			out = append(out, ip.AsSlice())
+		}
+		return out, nil
+	}
 	ip, err := resolveIPWithResolver(ctx, host, dr.prefer, resolver.ProxyServerHostResolver)
 	if err != nil {
 		return nil, fmt.Errorf("can't resolve ip: %w", err)

@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/metacubex/mihomo/common/atomic"
+	"github.com/metacubex/mihomo/component/entryoverride"
 	"github.com/metacubex/mihomo/component/keepalive"
 	"github.com/metacubex/mihomo/component/mptcp"
 	"github.com/metacubex/mihomo/component/resolver"
@@ -50,11 +51,23 @@ func DialContext(ctx context.Context, network, address string, options ...Option
 		network = fmt.Sprintf("%s%d", network, opt.network)
 	}
 
-	ips, port, err := parseAddr(ctx, network, address, opt.resolver)
+	ips, port, entry, err := parseAddr(ctx, network, address, opt)
 	if err != nil {
 		return nil, err
 	}
+	if entry {
+		host, _, _ := net.SplitHostPort(address)
+		return dialEntry(ctx, network, host, ips, port, opt)
+	}
+	conn, err := dialIPs(ctx, network, ips, port, opt)
+	if err == nil && opt.resolver == nil {
+		// MeowX：出站自己先解析好 server 再拨 IP（mieru 等）时，拨到的是主控指定入口 IP 也登记下来，这个入口下线时关掉
+		trackEntryLiteral(ctx, address, conn)
+	}
+	return conn, err
+}
 
+func dialIPs(ctx context.Context, network string, ips []netip.Addr, port string, opt option) (net.Conn, error) {
 	tcpConcurrent := GetTcpConcurrent()
 
 	switch network {
@@ -83,7 +96,12 @@ func ListenPacket(ctx context.Context, network, address string, rAddrPort netip.
 	if err != nil {
 		return nil, err
 	}
-	return lc.ListenPacket(ctx, network, address)
+	pc, err := lc.ListenPacket(ctx, network, address)
+	if err == nil && !entryoverride.InEntryDial(ctx) {
+		// MeowX：发往主控指定入口 IP 的 UDP socket（节点的 UDP / QUIC）登记下来，这个入口下线时关掉
+		entryoverride.TrackIP(rAddrPort.Addr(), pc)
+	}
+	return pc, err
 }
 
 func Listen(ctx context.Context, network, address string, options ...Option) (net.Listener, error) {
@@ -375,13 +393,18 @@ type dialResult struct {
 	isPrimary bool
 }
 
-func parseAddr(ctx context.Context, network, address string, preferResolver resolver.Resolver) ([]netip.Addr, string, error) {
+func parseAddr(ctx context.Context, network, address string, opt option) ([]netip.Addr, string, bool, error) {
 	host, port, err := net.SplitHostPort(address)
 	if err != nil {
-		return nil, "-1", err
+		return nil, "-1", false, err
 	}
 
+	preferResolver := opt.resolver
 	if preferResolver == nil {
+		// 没指定解析器 = 拨代理节点的 server。MeowX：先查主控指定的转发入口（入口覆盖表，见 entry.go），在 hosts 与 DNS 之前
+		if ips := entryoverride.Lookup(host, networkFamily(network)); len(ips) > 0 {
+			return preferFamily(ips, opt.prefer), port, true, nil
+		}
 		preferResolver = resolver.ProxyServerHostResolver
 	}
 
@@ -395,14 +418,14 @@ func parseAddr(ctx context.Context, network, address string, preferResolver reso
 		ips, err = resolver.LookupIPWithResolver(ctx, host, preferResolver)
 	}
 	if err != nil {
-		return nil, "-1", fmt.Errorf("dns resolve failed: %w", err)
+		return nil, "-1", false, fmt.Errorf("dns resolve failed: %w", err)
 	}
 	for i, ip := range ips {
 		if ip.Is4In6() {
 			ips[i] = ip.Unmap()
 		}
 	}
-	return ips, port, nil
+	return ips, port, false, nil
 }
 
 func listenAddressIsLoopback(address string) bool {

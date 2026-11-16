@@ -7,6 +7,7 @@ import (
 	"net/netip"
 	"strconv"
 
+	"github.com/metacubex/mihomo/component/entryoverride"
 	"github.com/metacubex/mihomo/component/resolver"
 	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/transport/socks5"
@@ -45,13 +46,49 @@ func resolveIPWithResolver(ctx context.Context, host string, prefer C.DNSPrefer,
 	}
 }
 
+// entryOverrideIPs MeowX：节点 server 在入口覆盖表里（主控指定的转发入口）时的 IP，已轮转、按偏好排好；没有回 nil。
+func entryOverrideIPs(host string, prefer C.DNSPrefer) []netip.Addr {
+	family := 0
+	switch prefer {
+	case C.IPv4Only:
+		family = 4
+	case C.IPv6Only:
+		family = 6
+	}
+	ips := entryoverride.Lookup(host, family)
+	if len(ips) < 2 {
+		return ips
+	}
+	want6 := prefer == C.IPv6Prefer
+	out := make([]netip.Addr, 0, len(ips))
+	for _, ip := range ips {
+		if ip.Is6() == want6 {
+			out = append(out, ip)
+		}
+	}
+	for _, ip := range ips {
+		if ip.Is6() != want6 {
+			out = append(out, ip)
+		}
+	}
+	return out
+}
+
+// resolveProxyServerIP 解析节点 server（UDP / QUIC 地址等不经拨号器的地方）：先查入口覆盖表，再照常 hosts → DNS。
+func resolveProxyServerIP(ctx context.Context, host string, prefer C.DNSPrefer) (netip.Addr, error) {
+	if ips := entryOverrideIPs(host, prefer); len(ips) > 0 {
+		return ips[0], nil
+	}
+	return resolveIPWithResolver(ctx, host, prefer, resolver.ProxyServerHostResolver)
+}
+
 func resolveUDPAddr(ctx context.Context, network, address string, prefer C.DNSPrefer) (*net.UDPAddr, error) {
 	host, port, err := net.SplitHostPort(address)
 	if err != nil {
 		return nil, err
 	}
 
-	ip, err := resolveIPWithResolver(ctx, host, prefer, resolver.ProxyServerHostResolver)
+	ip, err := resolveProxyServerIP(ctx, host, prefer)
 
 	if err != nil {
 		return nil, err

@@ -125,3 +125,25 @@ func TestPanelSpeedTestGrantRejects(t *testing.T) {
 		t.Errorf("not logged in: err = %v", err)
 	}
 }
+
+// 外壳接实时通道（规格 entry-realtime.md §7）：只打印 {"base","token"}，没登录时报错
+func TestPanelRealtimeConfig(t *testing.T) {
+	old := panelStatePath
+	defer func() { panelStatePath = old }()
+	panelStatePath = filepath.Join(t.TempDir(), "panel.json")
+	if _, err := panelRealtimeConfig(); err == nil {
+		t.Fatal("not logged in should be an error")
+	}
+	st := &panelState{Base: "https://panel.example.com", Token: "T0KEN", Username: "alice", ReportURL: "https://panel.example.com/api/fw/x/add"}
+	if err := st.save(); err != nil {
+		t.Fatal(err)
+	}
+	out, err := panelRealtimeConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	m, _ := out.(map[string]any)
+	if len(m) != 2 || m["base"] != "https://panel.example.com" || m["token"] != "T0KEN" {
+		t.Fatalf("realtime-config = %+v", out)
+	}
+}

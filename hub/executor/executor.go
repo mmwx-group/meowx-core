@@ -21,6 +21,7 @@ import (
 	mihomoHttp "github.com/metacubex/mihomo/component/http"
 	"github.com/metacubex/mihomo/component/iface"
 	"github.com/metacubex/mihomo/component/keepalive"
+	"github.com/metacubex/mihomo/component/panelrt"
 	"github.com/metacubex/mihomo/component/profile"
 	"github.com/metacubex/mihomo/component/profile/cachefile"
 	"github.com/metacubex/mihomo/component/resolver"
@@ -102,6 +103,7 @@ func ApplyConfig(cfg *config.Config, force bool) {
 	updateExperimental(cfg.Experimental)
 	updateUsers(cfg.Users)
 	updateProxies(cfg.Proxies, cfg.Providers)
+	panelrt.OnConfigApplied() // MeowX：读入落盘的入口覆盖表、按新节点重取 server 集合（主控指定入口，见 component/entryoverride）
 	updateRules(cfg.Rules, cfg.SubRules, cfg.RuleProviders)
 	updatePriorityRules(cfg.PriorityRules)
 	updateSniffer(cfg.Sniffer)
@@ -124,6 +126,7 @@ func ApplyConfig(cfg *config.Config, force bool) {
 	loadProvider(cfg.Providers)
 	updateProfile(cfg)
 	loadProvider(cfg.RuleProviders)
+	panelrt.OnConfigApplied() // 代理集加载完，节点的 server 集合再取一次
 	runtime.GC()
 	tunnel.OnRunning()
 	updateUpdater(cfg)

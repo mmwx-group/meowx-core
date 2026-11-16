@@ -136,6 +136,8 @@ func router(isDebug bool, secret string, dohServer string, cors Cors) *chi.Mux {
 		r.Mount("/dns", dnsRouter())
 		r.Mount("/storage", storageRouter())
 		r.Mount("/meowx/speedtest", meowxSpeedTestRouter())
+		r.Mount("/meowx/realtime", meowxRealtimeRouter())
+		r.Mount("/meowx/entries", meowxEntriesRouter())
 		if !embedMode { // disallow restart in embed mode
 			r.Mount("/restart", restartRouter())
 		}

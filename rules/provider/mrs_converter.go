@@ -33,53 +33,46 @@ func ConvertToMrs(buf []byte, behavior P.RuleBehavior, format P.RuleFormat, w io
 			return nil
 		}
 
-		var encoder *zstd.Encoder
-		encoder, err = zstd.NewWriter(w)
-		if err != nil {
-			return err
-		}
-		defer func() {
-			zstdErr := encoder.Close()
-			if err == nil {
-				err = zstdErr
-			}
-		}()
-
-		// header
-		_, err = encoder.Write(MrsMagicBytes[:])
-		if err != nil {
-			return err
-		}
-
-		// behavior
-		_behavior := []byte{behavior.Byte()}
-		_, err = encoder.Write(_behavior[:])
-		if err != nil {
-			return err
-		}
-
-		// count
-		count := int64(_strategy.Count())
-		err = binary.Write(encoder, binary.BigEndian, count)
-		if err != nil {
-			return err
-		}
-
-		// extra (reserved for future using)
-		var extra []byte
-		err = binary.Write(encoder, binary.BigEndian, int64(len(extra)))
-		if err != nil {
-			return err
-		}
-		_, err = encoder.Write(extra)
-		if err != nil {
-			return err
-		}
-
-		return _strategy.WriteMrs(encoder)
+		return writeMrs(w, _strategy, behavior)
 	} else {
 		return ErrInvalidFormat
 	}
+}
+
+// writeMrs 把已经解析好的策略按 MRSv1 格式写出（zstd 压缩：魔数、behavior、条数、extra、策略本体）。
+func writeMrs(w io.Writer, strategy mrsRuleStrategy, behavior P.RuleBehavior) (err error) {
+	encoder, err := zstd.NewWriter(w)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		zstdErr := encoder.Close()
+		if err == nil {
+			err = zstdErr
+		}
+	}()
+
+	// header
+	if _, err = encoder.Write(MrsMagicBytes[:]); err != nil {
+		return err
+	}
+	// behavior
+	if _, err = encoder.Write([]byte{behavior.Byte()}); err != nil {
+		return err
+	}
+	// count
+	if err = binary.Write(encoder, binary.BigEndian, int64(strategy.Count())); err != nil {
+		return err
+	}
+	// extra (reserved for future using)
+	var extra []byte
+	if err = binary.Write(encoder, binary.BigEndian, int64(len(extra))); err != nil {
+		return err
+	}
+	if _, err = encoder.Write(extra); err != nil {
+		return err
+	}
+	return strategy.WriteMrs(encoder)
 }
 
 func ConvertMain(args []string) {

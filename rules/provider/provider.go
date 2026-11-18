@@ -140,7 +140,7 @@ func NewRuleSetProvider(name string, behavior P.RuleBehavior, format P.RuleForma
 		rp.strategy = rulesParseInline(payload, rp.strategy)
 	}
 	rp.Fetcher = resource.NewFetcher(name, interval, vehicle, bundleFile, func(bytes []byte) (ruleStrategy, error) {
-		return rulesParse(bytes, newStrategy(behavior, parse), format)
+		return cachedRulesParse(mrsCachePath(vehicle), bytes, newStrategy(behavior, parse), format)
 	}, onUpdate)
 
 	wrapper := &RuleSetProvider{

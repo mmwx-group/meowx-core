@@ -17,7 +17,7 @@ import (
 //	                         或单个 {"base","token"|"rt","hook":…}；空正文 / 空列表 = 停掉。回当前状态；参数不对 400 + {"message"}
 //	GET    /meowx/realtime   各通道状态（panelrt.StatusInfo）
 //	DELETE /meowx/realtime   停掉全部通道（入口覆盖表留着）
-//	GET    /meowx/entries    当前入口覆盖表 {"entries":[…]}
+//	GET    /meowx/entries    当前入口覆盖表 {"entries":[…]}（entryoverride.View；"ports" 没有 = 主控没给、只比 server，[] = 不匹配任何节点）
 //	DELETE /meowx/entries    清掉入口覆盖（?source=<主控地址> 只清那个主控的；退出登录、删掉那个主控的全部订阅时用）
 func meowxRealtimeRouter() http.Handler {
 	r := chi.NewRouter()

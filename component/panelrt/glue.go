@@ -36,34 +36,36 @@ func eachProxy(fn func(C.Proxy)) {
 	}
 }
 
-func proxyHost(p C.Proxy) string {
+// proxyHost 节点的 server（规范写法）与端口。
+func proxyHost(p C.Proxy) (string, uint16) {
 	if p == nil {
-		return ""
+		return "", 0
 	}
-	host, _, err := net.SplitHostPort(p.Addr())
+	host, port, err := net.SplitHostPort(p.Addr())
 	if err != nil {
-		return ""
+		return "", 0
 	}
-	return entryoverride.NormalizeKey(host)
+	return entryoverride.NormalizeKey(host), entryoverride.PortOf(port)
 }
 
-// proxyServers 当前配置里全部节点的 server。
-func proxyServers() []string {
-	var out []string
+// proxyServers 当前配置里全部节点的 server 与端口。
+func proxyServers() []entryoverride.Server {
+	var out []entryoverride.Server
 	eachProxy(func(p C.Proxy) {
-		if h := proxyHost(p); h != "" {
-			out = append(out, h)
+		if h, port := proxyHost(p); h != "" {
+			out = append(out, entryoverride.Server{Host: h, Port: port})
 		}
 	})
 	return out
 }
 
-// closeTrackers 关掉连接表里经 server 为这个键的节点、远端地址是下线 IP 的连接（用户在连接页看得到的那些）。
+// closeTrackers 关掉连接表里经 server 为这个键、端口在入口端口里的节点、远端地址是下线 IP 的连接（用户在连接页看得到的那些）。
+// server 相同、端口不在 ports 里的是同机另开的直连节点，它的连接不归入口管，不关。
 // 远端地址认不出是哪个 IP 的（UDP 会话、部分多路复用）不在这里关，由拨号器登记的底层连接负责。
-func closeTrackers(server string, removed []netip.Addr) int {
+func closeTrackers(server string, ports entryoverride.Ports, removed []netip.Addr) int {
 	names := map[string]bool{}
 	eachProxy(func(p C.Proxy) {
-		if proxyHost(p) == server {
+		if h, port := proxyHost(p); h == server && ports.Match(port) {
 			names[p.Name()] = true
 		}
 	})

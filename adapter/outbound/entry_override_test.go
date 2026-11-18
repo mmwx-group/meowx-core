@@ -15,7 +15,7 @@ func TestResolveUDPAddrUsesEntryOverride(t *testing.T) {
 	if err := entryoverride.Load(filepath.Join(t.TempDir(), "entry-overrides.json")); err != nil {
 		t.Fatal(err)
 	}
-	entryoverride.SetServerSource(func() []string { return []string{"udp-entry.test"} })
+	entryoverride.SetServerSource(func() []entryoverride.Server { return []entryoverride.Server{{Host: "udp-entry.test"}} })
 	defer entryoverride.SetServerSource(nil)
 	entryoverride.Apply("https://panel.test", entryoverride.ScopeUser, entryoverride.OriginPush, entryoverride.Update{
 		Server: "udp-entry.test", Rev: 1,

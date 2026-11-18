@@ -14,22 +14,24 @@ import (
 // 主控 → 客户端的消息（规格 §2.2，扁平 JSON，type 判别）。rev 在入口消息里是毫秒时间戳（数字），
 // 在订阅消息里是指纹（字符串），所以先按原样收下再分别解析。
 type message struct {
-	Type       string          `json:"type"`
-	Domain     string          `json:"domain"`
-	HealthyIPs []string        `json:"healthyIPs"`
-	ChainID    json.RawMessage `json:"chainId"`
-	Rev        json.RawMessage `json:"rev"`
-	Reason     string          `json:"reason"`
-	Ready      *bool           `json:"ready"`
-	Entries    []snapshotEntry `json:"entries"`
-	Subs       *[]rawSubRev    `json:"subs"` // 没有这个字段（旧主控）= 这个主控来的全部订阅
+	Type       string             `json:"type"`
+	Domain     string             `json:"domain"`
+	HealthyIPs []string           `json:"healthyIPs"`
+	ChainID    json.RawMessage    `json:"chainId"`
+	Rev        json.RawMessage    `json:"rev"`
+	Reason     string             `json:"reason"`
+	Ports      *[]json.RawMessage `json:"ports"` // 入口端口；没有这个字段（老主控）= 只比 server，[] = 不匹配任何节点
+	Ready      *bool              `json:"ready"`
+	Entries    []snapshotEntry    `json:"entries"`
+	Subs       *[]rawSubRev       `json:"subs"` // 没有这个字段（旧主控）= 这个主控来的全部订阅
 }
 
 type snapshotEntry struct {
-	Server  string          `json:"server"`
-	ChainID json.RawMessage `json:"chainId"`
-	IPs     []string        `json:"ips"`
-	Rev     json.RawMessage `json:"rev"`
+	Server  string             `json:"server"`
+	ChainID json.RawMessage    `json:"chainId"`
+	IPs     []string           `json:"ips"`
+	Rev     json.RawMessage    `json:"rev"`
+	Ports   *[]json.RawMessage `json:"ports"` // 同 message.Ports
 }
 
 type rawSubRev struct {
@@ -83,6 +85,21 @@ func parseIPs(list []string) []netip.Addr {
 	return out
 }
 
+// parsePorts 入口端口（规格 §1）：没有字段 = 零值（只比 server）；有字段时取其中合法的端口（数字或数字字符串），
+// 一个都没有也是「给了、为空」= 不匹配任何节点。
+func parsePorts(raw *[]json.RawMessage) entryoverride.Ports {
+	if raw == nil {
+		return entryoverride.Ports{}
+	}
+	list := make([]uint16, 0, len(*raw))
+	for _, r := range *raw {
+		if n, ok := parseInt64(r); ok && n > 0 && n <= 65535 {
+			list = append(list, uint16(n))
+		}
+	}
+	return entryoverride.PortList(list...)
+}
+
 // ack 回执（规格 §2.5）：应用完一个键的变更后发 {"type":"entry_ack","chainId","rev"}。
 type ack struct {
 	ChainID int64
@@ -103,7 +120,7 @@ func (c *channel) handleMessage(m *message, origin string, received time.Time) [
 		}
 		chainID, _ := parseInt64(m.ChainID)
 		res := entryoverride.Apply(c.cfg.Base, c.scope, origin, entryoverride.Update{
-			Server: m.Domain, IPs: parseIPs(m.HealthyIPs), Rev: rev, ChainID: chainID, Reason: m.Reason})
+			Server: m.Domain, IPs: parseIPs(m.HealthyIPs), Ports: parsePorts(m.Ports), Rev: rev, ChainID: chainID, Reason: m.Reason})
 		// 推送的决定本机已经在用了（刚换上，或者之前就收到过）才回执；旧主控不带 rev，不回
 		if hasRev && res.Server != "" && res.Rev >= rev {
 			return []ack{{ChainID: chainID, Rev: rev}}
@@ -142,7 +159,8 @@ func (c *channel) applySnapshot(ready bool, entries []snapshotEntry, origin stri
 			rev = asOf.UnixMilli()
 		}
 		chainID, _ := parseInt64(e.ChainID)
-		list = append(list, entryoverride.Update{Server: e.Server, IPs: parseIPs(e.IPs), Rev: rev, ChainID: chainID})
+		list = append(list, entryoverride.Update{Server: e.Server, IPs: parseIPs(e.IPs), Ports: parsePorts(e.Ports),
+			Rev: rev, ChainID: chainID})
 	}
 	results := entryoverride.ApplySnapshot(c.cfg.Base, c.scope, origin, ready, asOf, list)
 	var acks []ack

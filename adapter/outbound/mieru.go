@@ -58,13 +58,14 @@ func (pd mieruPacketDialer) ListenPacket(ctx context.Context, network, laddr, ra
 
 type mieruDNSResolver struct {
 	prefer C.DNSPrefer
+	port   uint16 // 节点端口（入口覆盖按 server + 端口认）；用 port-range 的节点是 0 = 不知道
 }
 
 var _ mierucommon.DNSResolver = (*mieruDNSResolver)(nil)
 
 func (dr mieruDNSResolver) LookupIP(ctx context.Context, network, host string) (_ []net.IP, err error) {
 	// MeowX：节点 server 在入口覆盖表里（主控指定的转发入口）时直接用表里的 IP
-	if ips := entryOverrideIPs(host, dr.prefer); len(ips) > 0 {
+	if ips := entryOverrideIPs(host, dr.port, dr.prefer); len(ips) > 0 {
 		out := make([]net.IP, 0, len(ips))
 		for _, ip := range ips {
 			out = append(out, ip.AsSlice())
@@ -134,7 +135,7 @@ func (m *Mieru) ensureClientIsRunning() error {
 	}
 	config.Dialer = m.dialer
 	config.PacketDialer = mieruPacketDialer{Dialer: m.dialer}
-	config.Resolver = mieruDNSResolver{prefer: m.prefer}
+	config.Resolver = mieruDNSResolver{prefer: m.prefer, port: uint16(m.option.Port)}
 	if err := m.client.Store(config); err != nil {
 		return err
 	}

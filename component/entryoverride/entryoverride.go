@@ -5,6 +5,8 @@
 //
 //   - 键 = 订阅里节点 server 的原文：域名一律小写、去掉结尾的点，IP 按规范写法（NormalizeKey）。只在当前配置里
 //     有节点的 server 等于这个键时才用（服务器集合由 SetServerSource 注册的函数给出，配置重载时 InvalidateServers）。
+//   - 入口端口（ports，规格 §1）：入口键可能和同一台机器上另开的直连节点撞，所以主控给了 ports 时只有
+//     server 等于键且端口在 ports 里的节点用覆盖（[] = 不匹配任何节点）；没给（老主控）照旧只比 server。见 Ports。
 //   - rev 是主控做决定时的毫秒时间戳，同一个键只增不减：只接受比手上大的。空的 IP 集合 = 撤销覆盖、回到 DNS
 //     （留一条空记录记住 rev，免得乱序到达的旧推送又把它加回来）。
 //   - 多个 IP 轮流用：每次查询从下一个开始，拨号器逐个试，一个不通当场换下一个（component/dialer）。
@@ -48,10 +50,51 @@ const (
 // 只读凭证（rt）的通道各用自己的范围（只覆盖那一份订阅用到的链），见 ApplySnapshot。
 const ScopeUser = "user"
 
+// Ports 入口端口（规格 §1）：Set = 主控给了 ports 字段，这时只有端口在 List 里的节点用覆盖（List 为空 = 不匹配任何节点）；
+// 没给（老主控，零值）只比 server。
+type Ports struct {
+	Set  bool
+	List []uint16 // 升序、去重，不含 0
+}
+
+// PortList 主控给了 ports 字段时的写法（空切片 = []，不匹配任何节点）。
+func PortList(list ...uint16) Ports {
+	return normalizePorts(Ports{Set: true, List: list})
+}
+
+// Match 端口为 port 的节点用不用这条覆盖。port 为 0 = 不知道节点端口：只有没给 ports 字段的才匹配。
+func (p Ports) Match(port uint16) bool {
+	if !p.Set {
+		return true
+	}
+	for _, q := range p.List {
+		if q == port {
+			return true
+		}
+	}
+	return false
+}
+
+// PortOf 端口文本转数字，不是合法端口回 0（= 不知道）。
+func PortOf(s string) uint16 {
+	n, err := strconv.ParseUint(strings.TrimSpace(s), 10, 16)
+	if err != nil {
+		return 0
+	}
+	return uint16(n)
+}
+
+// Server 当前配置里一个节点的 server 与端口（SetServerSource 的来源给出）。
+type Server struct {
+	Host string
+	Port uint16
+}
+
 // Update 主控的一条入口状态（entry_failover 一条，或 entry_snapshot 里的一项）。
 type Update struct {
 	Server  string
 	IPs     []netip.Addr
+	Ports   Ports // 零值 = 没有 ports 字段（老主控）
 	Rev     int64
 	ChainID int64
 	Reason  string
@@ -67,19 +110,21 @@ type Result struct {
 
 // View 给控制接口 / 界面看的一条记录。
 type View struct {
-	Server      string   `json:"server"`
-	IPs         []string `json:"ips"`
-	Rev         int64    `json:"rev"`
-	ChainID     int64    `json:"chainId"`
-	Source      string   `json:"source"`
-	UpdatedAt   int64    `json:"updatedAt"`   // 本机换上这份集合的时间（毫秒）
-	ConfirmedAt int64    `json:"confirmedAt"` // 上次被主控确认的时间（毫秒）
-	Active      bool     `json:"active"`      // 当前配置里有节点的 server 等于这个键（只有这时才会用它）
+	Server      string    `json:"server"`
+	IPs         []string  `json:"ips"`
+	Ports       *[]uint16 `json:"ports,omitempty"` // 入口端口：没有这个字段 = 主控没给（只比 server）；[] = 不匹配任何节点
+	Rev         int64     `json:"rev"`
+	ChainID     int64     `json:"chainId"`
+	Source      string    `json:"source"`
+	UpdatedAt   int64     `json:"updatedAt"`   // 本机换上这份集合的时间（毫秒）
+	ConfirmedAt int64     `json:"confirmedAt"` // 上次被主控确认的时间（毫秒）
+	Active      bool      `json:"active"`      // 当前配置里有节点的 server 等于这个键、端口也对得上（只有这时才会用它）
 }
 
 type entry struct {
 	server      string
 	ips         []netip.Addr // 空 = 撤销覆盖（只留着记 rev）
+	ports       Ports
 	rev         int64
 	chainID     int64
 	source      string
@@ -92,7 +137,7 @@ type entry struct {
 type table struct {
 	mu      sync.Mutex
 	entries map[string]*entry
-	byIP    map[netip.Addr][]string // 只含非空记录：IP → 用着它的键
+	byIP    map[netip.Addr][]string // 只含非空记录：IP → 用着它的键（不看端口）
 	path    string                  // 落盘路径；空 = 不落盘
 }
 
@@ -104,26 +149,27 @@ var (
 	now = time.Now
 
 	hookMu        sync.RWMutex
-	serverSource  func() []string
-	trackerCloser func(server string, removed []netip.Addr) int
+	serverSource  func() []Server
+	trackerCloser func(server string, ports Ports, removed []netip.Addr) int
 
 	serverMu      sync.Mutex
-	serverSet     map[string]struct{}
+	serverSet     map[string][]uint16 // 键 → 用这个 server 的节点的端口
 	serverSetAt   time.Time
 	serverSetDirt = true
 )
 
-// SetServerSource 注册「当前配置里全部节点的 server」的来源（component/panelrt 注册，读 tunnel 的节点与代理集）。
+// SetServerSource 注册「当前配置里全部节点的 server 与端口」的来源（component/panelrt 注册，读 tunnel 的节点与代理集）。
 // 没注册时不做键的限制。
-func SetServerSource(fn func() []string) {
+func SetServerSource(fn func() []Server) {
 	hookMu.Lock()
 	serverSource = fn
 	hookMu.Unlock()
 	InvalidateServers()
 }
 
-// SetTrackerCloser 注册按连接表关连接的函数：关掉经 server 为这个键的节点、远端地址是下线 IP 的连接，回关掉的条数。
-func SetTrackerCloser(fn func(server string, removed []netip.Addr) int) {
+// SetTrackerCloser 注册按连接表关连接的函数：关掉经 server 为这个键、端口 ports.Match 的节点、远端地址是下线 IP 的连接，
+// 回关掉的条数（server 相同而端口不在 ports 里的直连节点不能关）。
+func SetTrackerCloser(fn func(server string, ports Ports, removed []netip.Addr) int) {
 	hookMu.Lock()
 	trackerCloser = fn
 	hookMu.Unlock()
@@ -148,8 +194,8 @@ func NormalizeKey(s string) string {
 	return strings.TrimSuffix(strings.ToLower(s), ".")
 }
 
-// isServerKey 键是不是当前配置里某个节点的 server。
-func isServerKey(key string) bool {
+// isServerKey 键是不是当前配置里某个节点的 server，且（主控给了 ports 时）其中有节点的端口在 ports 里。
+func isServerKey(key string, ports Ports) bool {
 	hookMu.RLock()
 	source := serverSource
 	hookMu.RUnlock()
@@ -159,21 +205,30 @@ func isServerKey(key string) bool {
 	serverMu.Lock()
 	defer serverMu.Unlock()
 	if serverSetDirt || serverSet == nil || now().Sub(serverSetAt) > serverCacheTTL {
-		set := map[string]struct{}{}
+		set := map[string][]uint16{}
 		for _, s := range source() {
-			if s = NormalizeKey(s); s != "" {
-				set[s] = struct{}{}
+			if h := NormalizeKey(s.Host); h != "" {
+				set[h] = append(set[h], s.Port)
 			}
 		}
 		serverSet, serverSetAt, serverSetDirt = set, now(), false
 	}
-	_, ok := serverSet[key]
-	return ok
+	nodePorts, ok := serverSet[key]
+	if !ok || !ports.Set {
+		return ok
+	}
+	for _, p := range nodePorts {
+		if ports.Match(p) {
+			return true
+		}
+	}
+	return false
 }
 
-// Lookup 节点 server 的覆盖 IP：没有覆盖（或键不在当前配置里、已过期）回 nil。family 4 / 6 只要该族，0 = 都要。
+// Lookup 节点 server 的覆盖 IP：没有覆盖（或键不在当前配置里、已过期、节点端口 port 不在入口端口里）回 nil。
+// port 为 0 = 不知道节点端口，只认没给 ports 字段的记录。family 4 / 6 只要该族，0 = 都要。
 // 每次查询从下一个 IP 开始轮转，返回的切片归调用方。
-func Lookup(host string, family int) []netip.Addr {
+func Lookup(host string, port uint16, family int) []netip.Addr {
 	if !active.Load() {
 		return nil
 	}
@@ -183,7 +238,7 @@ func Lookup(host string, family int) []netip.Addr {
 	}
 	tbl.mu.Lock()
 	e := tbl.entries[key]
-	if e == nil || len(e.ips) == 0 || now().Sub(e.confirmedAt) > ExpireAfter {
+	if e == nil || len(e.ips) == 0 || now().Sub(e.confirmedAt) > ExpireAfter || !e.ports.Match(port) {
 		tbl.mu.Unlock()
 		return nil
 	}
@@ -196,7 +251,7 @@ func Lookup(host string, family int) []netip.Addr {
 	}
 	start := atomic.AddUint32(&e.next, 1) - 1
 	tbl.mu.Unlock()
-	if len(ips) == 0 || !isServerKey(key) {
+	if len(ips) == 0 || !isServerKey(key, Ports{}) {
 		return nil
 	}
 	if n := uint32(len(ips)); n > 1 {
@@ -209,19 +264,22 @@ func Lookup(host string, family int) []netip.Addr {
 // Active 表里有没有正在生效的覆盖（拨号器热路径上先看它）。
 func Active() bool { return active.Load() }
 
-// KeysOfIP 当前有哪些键的集合里有这个 IP（给只知道远端 IP 的 UDP socket 登记用）。
-func KeysOfIP(ip netip.Addr) []string {
+// KeysOfIP 当前有哪些键的集合里有这个 IP、且端口 port 对得上入口端口（给只知道远端地址的 UDP socket 登记用；
+// port 为 0 = 不知道，只认没给 ports 字段的记录）。
+func KeysOfIP(ip netip.Addr, port uint16) []string {
 	if !active.Load() || !ip.IsValid() {
 		return nil
 	}
 	ip = ip.Unmap()
 	tbl.mu.Lock()
 	defer tbl.mu.Unlock()
-	keys := tbl.byIP[ip]
-	if len(keys) == 0 {
-		return nil
+	var out []string
+	for _, key := range tbl.byIP[ip] {
+		if e := tbl.entries[key]; e != nil && e.ports.Match(port) {
+			out = append(out, key)
+		}
 	}
-	return append([]string(nil), keys...)
+	return out
 }
 
 // Apply 应用一条推送（entry_failover / 拉取结果里的一项）。source = 来自哪个主控（base URL），scope 见 ScopeUser。
@@ -242,13 +300,17 @@ func ApplySnapshot(source, scope, origin string, ready bool, asOf time.Time, lis
 }
 
 type change struct {
-	server  string
-	ips     []netip.Addr
-	removed []netip.Addr
-	rev     int64
-	reason  string
-	dropped bool // 快照里没有了 / 过期，整条删掉
-	expired bool
+	server     string
+	ips        []netip.Addr
+	removed    []netip.Addr
+	ports      Ports
+	oldPorts   Ports
+	portsMoved bool  // 只有端口变了（或连同 IP 一起变）
+	closePorts Ports // 关连接时认哪些端口的节点：新旧入口端口的并集
+	rev        int64
+	reason     string
+	dropped    bool // 快照里没有了 / 过期，整条删掉
+	expired    bool
 }
 
 func apply(source, scope, origin string, list []Update, ready bool, asOf time.Time) []Result {
@@ -265,26 +327,32 @@ func apply(source, scope, origin string, list []Update, ready bool, asOf time.Ti
 		}
 		listed[key] = true
 		ips := normalizeIPs(u.IPs)
+		ports := normalizePorts(u.Ports)
 		e := tbl.entries[key]
 		res := Result{Server: key, ChainID: u.ChainID}
 		if e == nil || u.Rev > e.rev {
 			var old []netip.Addr
+			var oldPorts Ports
 			if e == nil {
 				e = &entry{server: key}
 				tbl.entries[key] = e
+				oldPorts = ports
 			} else {
-				old = e.ips
+				old, oldPorts = e.ips, e.ports
 			}
 			tbl.unindexLocked(e)
-			e.ips, e.rev, e.chainID, e.source, e.updatedAt = ips, u.Rev, u.ChainID, source, t
+			e.ips, e.ports, e.rev, e.chainID, e.source, e.updatedAt = ips, ports, u.Rev, u.ChainID, source, t
 			tbl.indexLocked(e)
 			res.Applied = true
-			if !sameIPs(old, ips) {
+			// 端口变了只有覆盖还在用时才值得记一行（撤销状态下端口用不上）
+			portsMoved := !samePorts(oldPorts, ports) && (len(old) > 0 || len(ips) > 0)
+			if !sameIPs(old, ips) || portsMoved {
 				var removed []netip.Addr
 				if len(ips) > 0 {
 					removed = diffIPs(old, ips)
 				}
-				changes = append(changes, change{server: key, ips: ips, removed: removed, rev: u.Rev, reason: u.Reason})
+				changes = append(changes, change{server: key, ips: ips, removed: removed, ports: ports, oldPorts: oldPorts,
+					portsMoved: portsMoved, closePorts: unionPorts(oldPorts, ports), rev: u.Rev, reason: u.Reason})
 			}
 		}
 		e.confirmedAt = t
@@ -316,7 +384,7 @@ func apply(source, scope, origin string, list []Update, ready bool, asOf time.Ti
 	for _, c := range changes {
 		closed := 0
 		if len(c.removed) > 0 {
-			closed = closeConnections(c.server, c.removed)
+			closed = closeConnections(c.server, c.closePorts, c.removed)
 		}
 		logChange(c, closed, origin)
 	}
@@ -359,7 +427,7 @@ func List() []View {
 		if len(e.ips) == 0 || t.Sub(e.confirmedAt) > ExpireAfter {
 			continue
 		}
-		v := View{Server: e.server, Rev: e.rev, ChainID: e.chainID, Source: e.source,
+		v := View{Server: e.server, Ports: portsJSON(e.ports), Rev: e.rev, ChainID: e.chainID, Source: e.source,
 			UpdatedAt: e.updatedAt.UnixMilli(), ConfirmedAt: e.confirmedAt.UnixMilli()}
 		for _, ip := range e.ips {
 			v.IPs = append(v.IPs, ip.String())
@@ -368,7 +436,7 @@ func List() []View {
 	}
 	tbl.mu.Unlock()
 	for i := range views {
-		views[i].Active = isServerKey(views[i].Server)
+		views[i].Active = isServerKey(views[i].Server, portsFromJSON(views[i].Ports))
 	}
 	sort.Slice(views, func(i, j int) bool { return views[i].Server < views[j].Server })
 	return views
@@ -377,14 +445,15 @@ func List() []View {
 // MARK: - 落盘
 
 type fileEntry struct {
-	Server      string   `json:"server"`
-	IPs         []string `json:"ips"`
-	Rev         int64    `json:"rev"`
-	ChainID     int64    `json:"chainId,omitempty"`
-	Source      string   `json:"source"`
-	Scopes      []string `json:"scopes,omitempty"`
-	UpdatedAt   int64    `json:"updatedAt"`
-	ConfirmedAt int64    `json:"confirmedAt"`
+	Server      string    `json:"server"`
+	IPs         []string  `json:"ips"`
+	Ports       *[]uint16 `json:"ports,omitempty"` // 没有 = 主控没给 ports（老主控 / 老落盘文件）；[] = 不匹配任何节点
+	Rev         int64     `json:"rev"`
+	ChainID     int64     `json:"chainId,omitempty"`
+	Source      string    `json:"source"`
+	Scopes      []string  `json:"scopes,omitempty"`
+	UpdatedAt   int64     `json:"updatedAt"`
+	ConfirmedAt int64     `json:"confirmedAt"`
 }
 
 type fileFormat struct {
@@ -422,8 +491,8 @@ func Load(path string) error {
 		if key == "" {
 			continue
 		}
-		e := &entry{server: key, rev: fe.Rev, chainID: fe.ChainID, source: fe.Source, scopes: fe.Scopes,
-			updatedAt: time.UnixMilli(fe.UpdatedAt), confirmedAt: time.UnixMilli(fe.ConfirmedAt)}
+		e := &entry{server: key, ports: normalizePorts(portsFromJSON(fe.Ports)), rev: fe.Rev, chainID: fe.ChainID,
+			source: fe.Source, scopes: fe.Scopes, updatedAt: time.UnixMilli(fe.UpdatedAt), confirmedAt: time.UnixMilli(fe.ConfirmedAt)}
 		for _, s := range fe.IPs {
 			if ip, err := netip.ParseAddr(s); err == nil {
 				e.ips = append(e.ips, ip.Unmap())
@@ -460,7 +529,7 @@ func (t *table) saveLocked() {
 	}
 	f := fileFormat{Version: 1, Entries: []fileEntry{}}
 	for _, e := range t.entries {
-		fe := fileEntry{Server: e.server, IPs: []string{}, Rev: e.rev, ChainID: e.chainID, Source: e.source,
+		fe := fileEntry{Server: e.server, IPs: []string{}, Ports: portsJSON(e.ports), Rev: e.rev, ChainID: e.chainID, Source: e.source,
 			Scopes: e.scopes, UpdatedAt: e.updatedAt.UnixMilli(), ConfirmedAt: e.confirmedAt.UnixMilli()}
 		for _, ip := range e.ips {
 			fe.IPs = append(fe.IPs, ip.String())
@@ -550,6 +619,75 @@ func normalizeIPs(ips []netip.Addr) []netip.Addr {
 	return out
 }
 
+// normalizePorts 去掉 0 与重复的，升序；Set 保持不变（空的 [] 仍然是 []）。
+func normalizePorts(p Ports) Ports {
+	if !p.Set {
+		return Ports{}
+	}
+	out := make([]uint16, 0, len(p.List))
+	seen := map[uint16]bool{}
+	for _, q := range p.List {
+		if q == 0 || seen[q] {
+			continue
+		}
+		seen[q] = true
+		out = append(out, q)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	return Ports{Set: true, List: out}
+}
+
+func samePorts(a, b Ports) bool {
+	if a.Set != b.Set || len(a.List) != len(b.List) {
+		return false
+	}
+	for i := range a.List {
+		if a.List[i] != b.List[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// unionPorts 两份入口端口的并集；任一份没给 ports 字段 = 不限端口。
+func unionPorts(a, b Ports) Ports {
+	if !a.Set || !b.Set {
+		return Ports{}
+	}
+	return normalizePorts(Ports{Set: true, List: append(append([]uint16(nil), a.List...), b.List...)})
+}
+
+// portsJSON 写成 JSON：没给 ports 字段 = nil（不出这个字段），给了空的 = []。
+func portsJSON(p Ports) *[]uint16 {
+	if !p.Set {
+		return nil
+	}
+	list := append([]uint16{}, p.List...)
+	return &list
+}
+
+func portsFromJSON(p *[]uint16) Ports {
+	if p == nil {
+		return Ports{}
+	}
+	return Ports{Set: true, List: append([]uint16{}, (*p)...)}
+}
+
+// portsText 日志里的端口：没给 ports 字段写「不限」，空的写「无」。
+func portsText(p Ports) string {
+	if !p.Set {
+		return "不限"
+	}
+	if len(p.List) == 0 {
+		return "无"
+	}
+	parts := make([]string, len(p.List))
+	for i, q := range p.List {
+		parts[i] = strconv.Itoa(int(q))
+	}
+	return strings.Join(parts, ", ")
+}
+
 func sameIPs(a, b []netip.Addr) bool {
 	if len(a) != len(b) {
 		return false
@@ -603,21 +741,23 @@ func removeScope(scopes []string, scope string) []string {
 }
 
 // closeConnections 一个键的 IP 下线：先按连接表关（用户看得到的连接，远端地址认得出是这个 IP 的），
-// 再关登记过、还开着的底层连接（多路复用的会话、QUIC、UDP socket、经链式代理的连接）。回关掉的条数。
-func closeConnections(server string, removed []netip.Addr) int {
+// 再关登记过、还开着的底层连接（多路复用的会话、QUIC、UDP socket、经链式代理的连接）。都只关端口在 ports 里的节点的，
+// server 相同的直连节点不碰。回关掉的条数。
+func closeConnections(server string, ports Ports, removed []netip.Addr) int {
 	hookMu.RLock()
 	closer := trackerCloser
 	hookMu.RUnlock()
 	n := 0
 	if closer != nil {
-		n += closer(server, removed)
+		n += closer(server, ports, removed)
 	}
-	n += registry.closeFor(server, removed)
+	n += registry.closeFor(server, ports, removed)
 	return n
 }
 
 // logChange 一次变更一行，例如：
-// [Entry] hk-entry.example.com → 203.0.113.11, 203.0.113.12，下线 203.0.113.10，关闭 3 条连接（主控推送 · unload · rev 1794000123456）
+// [Entry] hk-entry.example.com → 203.0.113.11, 203.0.113.12，下线 203.0.113.10，关闭 3 条连接，端口 50520, 50523（主控推送 · unload · rev 1794000123456）
+// 主控给了 ports 时末尾带「端口 …」（只有端口变了时写「端口 原 → 新」）；老主控没给就不写。
 // 记成 warning：OpenWrt / 飞牛缺省的日志级别是 warning，入口切换很少发生、又是排查连不上时最要紧的一行，info 级别看不到。
 func logChange(c change, closed int, origin string) {
 	switch {
@@ -642,6 +782,16 @@ func logChange(c change, closed int, origin string) {
 			b.WriteString("，关闭 ")
 			b.WriteString(strconv.Itoa(closed))
 			b.WriteString(" 条连接")
+		}
+		switch {
+		case c.portsMoved:
+			b.WriteString("，端口 ")
+			b.WriteString(portsText(c.oldPorts))
+			b.WriteString(" → ")
+			b.WriteString(portsText(c.ports))
+		case c.ports.Set:
+			b.WriteString("，端口 ")
+			b.WriteString(portsText(c.ports))
 		}
 	}
 	var tags []string

@@ -9,8 +9,8 @@ import (
 	"time"
 )
 
-// 到入口 IP 的底层连接登记：拨号器拨到覆盖表给的 IP 后登记（TCP、连上的 UDP、QUIC 会话），只知道远端 IP 的 UDP socket
-// 按 IP 登记；这个 IP 从某个键的集合里下线时关掉经这个键登记的那些——多路复用的会话、QUIC、UDP 关掉之后，
+// 到入口 IP 的底层连接登记：拨号器拨到覆盖表给的 IP 后登记（TCP、连上的 UDP、QUIC 会话），只知道远端地址的 UDP socket
+// 按 IP + 端口登记（端口不在入口端口里的不登记：同机直连节点的连接不归入口管）；这个 IP 从某个键的集合里下线时关掉经这个键登记的那些——多路复用的会话、QUIC、UDP 关掉之后，
 // 上面的代理连接一起断，应用重连时拨号器给的就是新集合里的 IP。
 //
 // 登记不包装连接（包一层会挡住 splice / vision 直通、syscall.Conn 判断这些优化），所以收不到「已关闭」的通知：
@@ -25,6 +25,7 @@ const (
 type tracked struct {
 	c    io.Closer
 	ip   netip.Addr
+	port uint16 // 节点端口；0 = 不知道
 	keys []string
 	at   time.Time
 }
@@ -51,24 +52,25 @@ func InEntryDial(ctx context.Context) bool {
 	return v
 }
 
-// Track 登记一条经键 server 拨到入口 IP 的连接。
-func Track(server string, ip netip.Addr, c io.Closer) {
+// Track 登记一条经键 server（节点端口 port）拨到入口 IP 的连接。
+func Track(server string, port uint16, ip netip.Addr, c io.Closer) {
 	if c == nil || !ip.IsValid() {
 		return
 	}
-	registry.add(&tracked{c: c, ip: ip.Unmap(), keys: []string{NormalizeKey(server)}, at: now()})
+	registry.add(&tracked{c: c, ip: ip.Unmap(), port: port, keys: []string{NormalizeKey(server)}, at: now()})
 }
 
-// TrackIP 登记一个只知道远端 IP 的 socket（UDP）：这个 IP 当前在哪些键的集合里就记在哪些键下；不在任何集合里不登记，回 false。
-func TrackIP(ip netip.Addr, c io.Closer) bool {
+// TrackIP 登记一个只知道远端地址的 socket（UDP）：这个 IP 当前在哪些键的集合里、端口也对得上入口端口，就记在哪些键下；
+// 一个都没有不登记，回 false。
+func TrackIP(addr netip.AddrPort, c io.Closer) bool {
 	if c == nil {
 		return false
 	}
-	keys := KeysOfIP(ip)
+	keys := KeysOfIP(addr.Addr(), addr.Port())
 	if len(keys) == 0 {
 		return false
 	}
-	registry.add(&tracked{c: c, ip: ip.Unmap(), keys: keys, at: now()})
+	registry.add(&tracked{c: c, ip: addr.Addr().Unmap(), port: addr.Port(), keys: keys, at: now()})
 	return true
 }
 
@@ -97,8 +99,8 @@ func (r *connRegistry) add(t *tracked) {
 	}
 }
 
-// closeFor 关掉经键 server 登记、远端是 removed 里某个 IP、还开着的连接，回关掉的条数。
-func (r *connRegistry) closeFor(server string, removed []netip.Addr) int {
+// closeFor 关掉经键 server 登记、节点端口 ports.Match、远端是 removed 里某个 IP、还开着的连接，回关掉的条数。
+func (r *connRegistry) closeFor(server string, ports Ports, removed []netip.Addr) int {
 	gone := map[netip.Addr]bool{}
 	for _, ip := range removed {
 		gone[ip.Unmap()] = true
@@ -106,7 +108,7 @@ func (r *connRegistry) closeFor(server string, removed []netip.Addr) int {
 	var victims []*tracked
 	r.mu.Lock()
 	for it := range r.items {
-		if !gone[it.ip] || !hasKey(it.keys, server) {
+		if !gone[it.ip] || !hasKey(it.keys, server) || !ports.Match(it.port) {
 			continue
 		}
 		delete(r.items, it)

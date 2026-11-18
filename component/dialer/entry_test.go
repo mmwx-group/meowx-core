@@ -24,7 +24,7 @@ func setupEntry(t *testing.T, server string, list ...string) {
 	if err := entryoverride.Load(filepath.Join(t.TempDir(), "entry-overrides.json")); err != nil {
 		t.Fatal(err)
 	}
-	entryoverride.SetServerSource(func() []string { return []string{server} })
+	entryoverride.SetServerSource(func() []entryoverride.Server { return []entryoverride.Server{{Host: server}} })
 	t.Cleanup(func() { entryoverride.SetServerSource(nil); entryoverride.ClearSource("") })
 	applyEntry(t, server, 1, list...)
 }
@@ -139,7 +139,7 @@ func TestNonProxyLookupsUnaffected(t *testing.T) {
 		t.Fatalf("resolver package must not see overrides: %v", ips)
 	}
 	// 不在当前配置里的键不用：照常走节点 server 的解析器
-	entryoverride.SetServerSource(func() []string { return []string{"someone-else.test"} })
+	entryoverride.SetServerSource(func() []entryoverride.Server { return []entryoverride.Server{{Host: "someone-else.test"}} })
 	old := resolver.ProxyServerHostResolver
 	proxyResolver := &fixedResolver{err: errors.New("nxdomain")}
 	resolver.ProxyServerHostResolver = proxyResolver
@@ -152,6 +152,46 @@ func TestNonProxyLookupsUnaffected(t *testing.T) {
 	}
 	if proxyResolver.calls.Load() == 0 {
 		t.Fatal("dial should fall back to the proxy-server resolver")
+	}
+}
+
+// 入口端口：同一 server 上另开的直连节点（端口不在 ports 里）照常走节点 server 的解析器，不改连入口 IP。
+func TestEntryPortsExcludeDirectNode(t *testing.T) {
+	port, accepted, _ := acceptAll(t)
+	if err := entryoverride.Load(filepath.Join(t.TempDir(), "entry-overrides.json")); err != nil {
+		t.Fatal(err)
+	}
+	entryoverride.SetServerSource(func() []entryoverride.Server {
+		return []entryoverride.Server{{Host: "entry.test", Port: uint16(port)}, {Host: "entry.test", Port: 9}}
+	})
+	t.Cleanup(func() { entryoverride.SetServerSource(nil); entryoverride.ClearSource("") })
+	entryoverride.Apply("https://panel.test", entryoverride.ScopeUser, entryoverride.OriginPush, entryoverride.Update{
+		Server: "entry.test", IPs: []netip.Addr{netip.MustParseAddr("127.0.0.1")}, Ports: entryoverride.PortList(uint16(port)), Rev: 1})
+
+	c, err := DialContext(context.Background(), "tcp", net.JoinHostPort("entry.test", strconv.Itoa(port)))
+	if err != nil {
+		t.Fatalf("forward node (port in ports) should use the override: %v", err)
+	}
+	_ = c.Close()
+
+	old := resolver.ProxyServerHostResolver
+	proxyResolver := &fixedResolver{err: errors.New("nxdomain")}
+	resolver.ProxyServerHostResolver = proxyResolver
+	defer func() { resolver.ProxyServerHostResolver = old }()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if c, err := DialContext(ctx, "tcp", net.JoinHostPort("entry.test", "9")); err == nil {
+		_ = c.Close()
+		t.Fatal("direct node (port not in ports) must not use the override")
+	}
+	if proxyResolver.calls.Load() == 0 {
+		t.Fatal("direct node should be resolved by the proxy-server resolver")
+	}
+	for deadline := time.Now().Add(2 * time.Second); accepted.Load() != 1 && time.Now().Before(deadline); {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if accepted.Load() != 1 {
+		t.Fatalf("accepted %d", accepted.Load())
 	}
 }
 

@@ -25,10 +25,10 @@ func New(proxy C.ProxyAdapter, statistic bool) C.Dialer {
 }
 
 func (p proxyDialer) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
-	// MeowX：经链式代理（dialer-proxy）拨节点时同样认主控指定的转发入口：把节点的 server 换成覆盖表给的 IP 再交给前置代理，
+	// MeowX：经链式代理（dialer-proxy）拨节点时同样认主控指定的转发入口（按 server + 端口）：把节点的 server 换成覆盖表给的 IP 再交给前置代理，
 	// 一个不通换下一个；拨通的连接登记下来，这个入口下线时关掉（见 component/entryoverride）
 	if host, port, err := net.SplitHostPort(address); err == nil {
-		if ips := entryoverride.Lookup(host, entryFamily(network)); len(ips) > 0 {
+		if ips := entryoverride.Lookup(host, entryoverride.PortOf(port), entryFamily(network)); len(ips) > 0 {
 			return p.dialEntry(ctx, network, host, port, ips)
 		}
 	}
@@ -47,7 +47,7 @@ func (p proxyDialer) dialEntry(ctx context.Context, network, host, port string, 
 		conn, err := p.dial(attemptCtx, network, net.JoinHostPort(ip.String(), port))
 		cancel()
 		if err == nil {
-			entryoverride.Track(host, ip, conn)
+			entryoverride.Track(host, entryoverride.PortOf(port), ip, conn)
 			return conn, nil
 		}
 		errs = append(errs, err)
@@ -104,7 +104,7 @@ func (p proxyDialer) ListenPacket(ctx context.Context, network, address string, 
 	currentMeta := &C.Metadata{Type: C.INNER, DstIP: rAddrPort.Addr(), DstPort: rAddrPort.Port()}
 	pc, err := p.listenPacket(ctx, currentMeta)
 	if err == nil && !entryoverride.InEntryDial(ctx) {
-		entryoverride.TrackIP(rAddrPort.Addr(), pc) // 发往入口 IP 的 UDP（经前置代理），这个入口下线时关掉
+		entryoverride.TrackIP(rAddrPort, pc) // 发往入口 IP 的 UDP（经前置代理），这个入口下线时关掉
 	}
 	return pc, err
 }

@@ -99,7 +99,7 @@ func ListenPacket(ctx context.Context, network, address string, rAddrPort netip.
 	pc, err := lc.ListenPacket(ctx, network, address)
 	if err == nil && !entryoverride.InEntryDial(ctx) {
 		// MeowX：发往主控指定入口 IP 的 UDP socket（节点的 UDP / QUIC）登记下来，这个入口下线时关掉
-		entryoverride.TrackIP(rAddrPort.Addr(), pc)
+		entryoverride.TrackIP(rAddrPort, pc)
 	}
 	return pc, err
 }
@@ -401,8 +401,8 @@ func parseAddr(ctx context.Context, network, address string, opt option) ([]neti
 
 	preferResolver := opt.resolver
 	if preferResolver == nil {
-		// 没指定解析器 = 拨代理节点的 server。MeowX：先查主控指定的转发入口（入口覆盖表，见 entry.go），在 hosts 与 DNS 之前
-		if ips := entryoverride.Lookup(host, networkFamily(network)); len(ips) > 0 {
+		// 没指定解析器 = 拨代理节点的 server。MeowX：先查主控指定的转发入口（入口覆盖表，按 server + 端口，见 entry.go），在 hosts 与 DNS 之前
+		if ips := entryoverride.Lookup(host, entryoverride.PortOf(port), networkFamily(network)); len(ips) > 0 {
 			return preferFamily(ips, opt.prefer), port, true, nil
 		}
 		preferResolver = resolver.ProxyServerHostResolver

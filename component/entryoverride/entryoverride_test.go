@@ -67,16 +67,16 @@ func TestRevOrdering(t *testing.T) {
 	if r := Apply(src, ScopeUser, OriginPush, Update{Server: "hk-entry.example.com", IPs: ips("203.0.113.10"), Rev: 100}); r.Applied {
 		t.Fatalf("equal rev must not apply: %+v", r)
 	}
-	if got := Lookup("hk-entry.example.com", 0); !sameSet(got, "203.0.113.10") {
+	if got := Lookup("hk-entry.example.com", 0, 0); !sameSet(got, "203.0.113.10") {
 		t.Fatalf("lookup = %v", got)
 	}
 	Apply(src, ScopeUser, OriginPush, Update{Server: "hk-entry.example.com", IPs: ips("203.0.113.11", "203.0.113.12"), Rev: 200})
-	if got := Lookup("HK-ENTRY.example.com", 0); !sameSet(got, "203.0.113.11", "203.0.113.12") {
+	if got := Lookup("HK-ENTRY.example.com", 0, 0); !sameSet(got, "203.0.113.11", "203.0.113.12") {
 		t.Fatalf("lookup after newer rev = %v", got)
 	}
 	// 撤销：空集合 = 回到 DNS；之后更旧的推送不能把它加回来
 	Apply(src, ScopeUser, OriginPush, Update{Server: "hk-entry.example.com", Rev: 300})
-	if got := Lookup("hk-entry.example.com", 0); got != nil {
+	if got := Lookup("hk-entry.example.com", 0, 0); got != nil {
 		t.Fatalf("revoked entry still used: %v", got)
 	}
 	if r := Apply(src, ScopeUser, OriginPush, Update{Server: "hk-entry.example.com", IPs: ips("203.0.113.10"), Rev: 250}); r.Applied {
@@ -92,7 +92,7 @@ func TestLookupRotationAndFamily(t *testing.T) {
 	Apply(src, ScopeUser, OriginPush, Update{Server: "e.example.com", IPs: ips("192.0.2.1", "192.0.2.2", "2001:db8::1"), Rev: 1})
 	firsts := map[string]int{}
 	for i := 0; i < 6; i++ {
-		got := Lookup("e.example.com", 0)
+		got := Lookup("e.example.com", 0, 0)
 		if len(got) != 3 {
 			t.Fatalf("lookup = %v", got)
 		}
@@ -101,36 +101,36 @@ func TestLookupRotationAndFamily(t *testing.T) {
 	if len(firsts) != 3 {
 		t.Fatalf("rotation should start at each IP in turn: %v", firsts)
 	}
-	if got := Lookup("e.example.com", 6); !sameSet(got, "2001:db8::1") {
+	if got := Lookup("e.example.com", 0, 6); !sameSet(got, "2001:db8::1") {
 		t.Fatalf("v6 only = %v", got)
 	}
-	if got := Lookup("e.example.com", 4); !sameSet(got, "192.0.2.1", "192.0.2.2") {
+	if got := Lookup("e.example.com", 0, 4); !sameSet(got, "192.0.2.1", "192.0.2.2") {
 		t.Fatalf("v4 only = %v", got)
 	}
 	// IP 作键（没设链域名时 server 是入口组第一台的地址）
 	Apply(src, ScopeUser, OriginPush, Update{Server: "[2001:DB8::20]", IPs: ips("2001:db8::21"), Rev: 1})
-	if got := Lookup("2001:db8::20", 0); !sameSet(got, "2001:db8::21") {
+	if got := Lookup("2001:db8::20", 0, 0); !sameSet(got, "2001:db8::21") {
 		t.Fatalf("ip key lookup = %v", got)
 	}
 }
 
 func TestKeyRestriction(t *testing.T) {
 	reset(t)
-	servers := []string{"other.example.com"}
+	servers := []Server{{Host: "other.example.com"}}
 	var mu sync.Mutex
-	SetServerSource(func() []string { mu.Lock(); defer mu.Unlock(); return servers })
+	SetServerSource(func() []Server { mu.Lock(); defer mu.Unlock(); return servers })
 	Apply(src, ScopeUser, OriginPush, Update{Server: "hk-entry.example.com", IPs: ips("203.0.113.10"), Rev: 1})
-	if got := Lookup("hk-entry.example.com", 0); got != nil {
+	if got := Lookup("hk-entry.example.com", 0, 0); got != nil {
 		t.Fatalf("key not in config must be ignored, got %v", got)
 	}
 	if l := List(); len(l) != 1 || l[0].Active {
 		t.Fatalf("list should show the entry as inactive: %+v", l)
 	}
 	mu.Lock()
-	servers = []string{"HK-Entry.Example.COM"}
+	servers = []Server{{Host: "HK-Entry.Example.COM"}}
 	mu.Unlock()
 	InvalidateServers()
-	if got := Lookup("hk-entry.example.com", 0); !sameSet(got, "203.0.113.10") {
+	if got := Lookup("hk-entry.example.com", 0, 0); !sameSet(got, "203.0.113.10") {
 		t.Fatalf("lookup after config reload = %v", got)
 	}
 	if l := List(); !l[0].Active {
@@ -149,7 +149,7 @@ func TestSnapshotReady(t *testing.T) {
 
 	// ready:false：只合并，不清理
 	ApplySnapshot(src, ScopeUser, OriginSnapshot, false, asOf, []Update{{Server: "a.example.com", IPs: ips("192.0.2.1"), Rev: 1}})
-	if Lookup("b.example.com", 0) == nil {
+	if Lookup("b.example.com", 0, 0) == nil {
 		t.Fatal("ready:false snapshot must not clear entries")
 	}
 	// ready:true：这个主控来的、快照里没有的清掉；别的主控的不动
@@ -157,13 +157,13 @@ func TestSnapshotReady(t *testing.T) {
 	if len(res) != 1 || !res[0].Applied || res[0].Rev != 2 {
 		t.Fatalf("snapshot results = %+v", res)
 	}
-	if Lookup("b.example.com", 0) != nil {
+	if Lookup("b.example.com", 0, 0) != nil {
 		t.Fatal("ready:true snapshot must clear unlisted keys of this source")
 	}
-	if got := Lookup("a.example.com", 0); !sameSet(got, "192.0.2.9") {
+	if got := Lookup("a.example.com", 0, 0); !sameSet(got, "192.0.2.9") {
 		t.Fatalf("a = %v", got)
 	}
-	if Lookup("c.example.com", 0) == nil {
+	if Lookup("c.example.com", 0, 0) == nil {
 		t.Fatal("entries of another panel must survive")
 	}
 	// 拉取请求在路上时推送新加的键：asOf 之后确认过的不清
@@ -171,7 +171,7 @@ func TestSnapshotReady(t *testing.T) {
 	time.Sleep(2 * time.Millisecond)
 	Apply(src, ScopeUser, OriginPush, Update{Server: "d.example.com", IPs: ips("192.0.2.4"), Rev: 5})
 	ApplySnapshot(src, ScopeUser, OriginPull, true, reqStart, []Update{{Server: "a.example.com", IPs: ips("192.0.2.9"), Rev: 2}})
-	if Lookup("d.example.com", 0) == nil {
+	if Lookup("d.example.com", 0, 0) == nil {
 		t.Fatal("entry pushed after the pull request started must not be cleared by its (older) snapshot")
 	}
 }
@@ -183,16 +183,16 @@ func TestSnapshotRTScopes(t *testing.T) {
 	only2 := Update{Server: "two.example.com", IPs: ips("192.0.2.3"), Rev: 1}
 	ApplySnapshot(src, "rt:1", OriginSnapshot, true, time.Now(), []Update{both, only1})
 	ApplySnapshot(src, "rt:2", OriginSnapshot, true, time.Now(), []Update{both, only2})
-	if Lookup("one.example.com", 0) == nil || Lookup("two.example.com", 0) == nil {
+	if Lookup("one.example.com", 0, 0) == nil || Lookup("two.example.com", 0, 0) == nil {
 		t.Fatal("two rt channels of the same panel must not clear each other's entries")
 	}
 	time.Sleep(2 * time.Millisecond)
 	// rt:1 那份订阅不再用 shared 与 one：one 只有它认领，清掉；shared 还有 rt:2 认领，留着
 	ApplySnapshot(src, "rt:1", OriginSnapshot, true, time.Now(), nil)
-	if Lookup("one.example.com", 0) != nil {
+	if Lookup("one.example.com", 0, 0) != nil {
 		t.Fatal("entry claimed only by rt:1 should be cleared")
 	}
-	if Lookup("shared.example.com", 0) == nil {
+	if Lookup("shared.example.com", 0, 0) == nil {
 		t.Fatal("entry still claimed by rt:2 must survive")
 	}
 	// 登录态的快照是这个用户全部的链：清这个主控来源的全部
@@ -212,10 +212,10 @@ func TestExpiry(t *testing.T) {
 	// 6 天后 fresh 被快照确认（rev 不变也算确认）
 	ApplySnapshot(src, ScopeUser, OriginSnapshot, false, now(), []Update{{Server: "fresh.example.com", IPs: ips("192.0.2.2"), Rev: 1}})
 	now = func() time.Time { return base.Add(7*24*time.Hour + time.Minute) }
-	if Lookup("old.example.com", 0) != nil {
+	if Lookup("old.example.com", 0, 0) != nil {
 		t.Fatal("entry not confirmed for 7 days must expire")
 	}
-	if Lookup("fresh.example.com", 0) == nil {
+	if Lookup("fresh.example.com", 0, 0) == nil {
 		t.Fatal("recently confirmed entry must survive")
 	}
 	ClearSource("https://nobody.example.com") // 任意一次变更都会把过期的清出落盘文件
@@ -257,7 +257,7 @@ func TestPersistenceRoundTrip(t *testing.T) {
 			t.Fatalf("round trip mismatch: %+v vs %+v", b, a)
 		}
 	}
-	if got := Lookup("hk-entry.example.com", 0); !sameSet(got, "203.0.113.11", "203.0.113.12") {
+	if got := Lookup("hk-entry.example.com", 0, 0); !sameSet(got, "203.0.113.11", "203.0.113.12") {
 		t.Fatalf("lookup after reload = %v", got)
 	}
 	// 读回来的 rev 仍然生效
@@ -297,7 +297,7 @@ func (f *fakeConn) closed() bool             { return f.ctx.Err() != nil }
 func TestCloseConnectionsOnRemoval(t *testing.T) {
 	reset(t)
 	var hookCalls []string
-	SetTrackerCloser(func(server string, removed []netip.Addr) int {
+	SetTrackerCloser(func(server string, ports Ports, removed []netip.Addr) int {
 		for _, ip := range removed {
 			hookCalls = append(hookCalls, server+"|"+ip.String())
 		}
@@ -309,13 +309,13 @@ func TestCloseConnectionsOnRemoval(t *testing.T) {
 	b := newFakeConn() // hk 经 .11
 	c := newFakeConn() // jp 经 .10（同一个 IP，别的键）
 	u := newFakeConn() // 只知道 IP 的 UDP socket，.10 当时在 hk 与 jp 两个集合里
-	Track("hk.example.com", netip.MustParseAddr("203.0.113.10"), a)
-	Track("hk.example.com", netip.MustParseAddr("203.0.113.11"), b)
-	Track("jp.example.com", netip.MustParseAddr("203.0.113.10"), c)
-	if !TrackIP(netip.MustParseAddr("203.0.113.10"), u) {
+	Track("hk.example.com", 443, netip.MustParseAddr("203.0.113.10"), a)
+	Track("hk.example.com", 443, netip.MustParseAddr("203.0.113.11"), b)
+	Track("jp.example.com", 443, netip.MustParseAddr("203.0.113.10"), c)
+	if !TrackIP(netip.MustParseAddrPort("203.0.113.10:443"), u) {
 		t.Fatal("TrackIP should register an IP that is in a set")
 	}
-	if TrackIP(netip.MustParseAddr("198.51.100.1"), newFakeConn()) {
+	if TrackIP(netip.MustParseAddrPort("198.51.100.1:443"), newFakeConn()) {
 		t.Fatal("TrackIP must ignore IPs that are in no set")
 	}
 
@@ -349,7 +349,7 @@ func TestRegistryPrunesClosed(t *testing.T) {
 	reset(t)
 	for i := 0; i < registryPruneEvery*2; i++ {
 		c := newFakeConn()
-		Track("x.example.com", netip.MustParseAddr("192.0.2.1"), c)
+		Track("x.example.com", 443, netip.MustParseAddr("192.0.2.1"), c)
 		_ = c.Close()
 	}
 	if n := registry.size(); n >= registryPruneEvery {
@@ -369,5 +369,215 @@ func TestNormalizeKey(t *testing.T) {
 		if got := NormalizeKey(in); got != want {
 			t.Errorf("NormalizeKey(%q) = %q, want %q", in, got, want)
 		}
+	}
+}
+
+// 入口端口（规格 §1）：没有 ports 字段只比 server；有时节点端口要在里面；[] 不匹配任何节点；端口不知道（0）只认没给 ports 的。
+func TestPortsMatching(t *testing.T) {
+	reset(t)
+	Apply(src, ScopeUser, OriginPush, Update{Server: "legacy.example.com", IPs: ips("192.0.2.1"), Rev: 1})
+	Apply(src, ScopeUser, OriginPush, Update{Server: "fw.example.com", IPs: ips("192.0.2.2"), Ports: PortList(50523, 50520, 50523, 0), Rev: 1})
+	Apply(src, ScopeUser, OriginPush, Update{Server: "empty.example.com", IPs: ips("192.0.2.3"), Ports: PortList(), Rev: 1})
+
+	if Lookup("legacy.example.com", 443, 0) == nil || Lookup("legacy.example.com", 0, 0) == nil {
+		t.Fatal("entry without ports must match by server only")
+	}
+	if got := Lookup("fw.example.com", 50520, 0); !sameSet(got, "192.0.2.2") {
+		t.Fatalf("port in ports = %v", got)
+	}
+	if Lookup("fw.example.com", 50523, 4) == nil {
+		t.Fatal("second port in ports should match")
+	}
+	if Lookup("fw.example.com", 22, 0) != nil {
+		t.Fatal("port not in ports (direct node on the same server) must not match")
+	}
+	if Lookup("fw.example.com", 0, 0) != nil {
+		t.Fatal("unknown port must not match an entry that has ports")
+	}
+	if Lookup("empty.example.com", 443, 0) != nil || Lookup("empty.example.com", 0, 0) != nil {
+		t.Fatal("ports [] must match no node")
+	}
+	// KeysOfIP（只知道远端地址的 UDP socket）同样按端口认
+	if k := KeysOfIP(netip.MustParseAddr("192.0.2.2"), 50520); len(k) != 1 || k[0] != "fw.example.com" {
+		t.Fatalf("keys of ip with matching port = %v", k)
+	}
+	if k := KeysOfIP(netip.MustParseAddr("192.0.2.2"), 22); len(k) != 0 {
+		t.Fatalf("keys of ip with other port = %v", k)
+	}
+
+	// Active：有节点 server 等于键、端口也对得上才算
+	SetServerSource(func() []Server {
+		return []Server{{Host: "legacy.example.com", Port: 1}, {Host: "fw.example.com", Port: 22}, {Host: "empty.example.com", Port: 443}}
+	})
+	act := map[string]bool{}
+	for _, v := range List() {
+		act[v.Server] = v.Active
+	}
+	if !act["legacy.example.com"] || act["fw.example.com"] || act["empty.example.com"] {
+		t.Fatalf("active with only a direct node on fw = %v", act)
+	}
+	SetServerSource(func() []Server {
+		return []Server{{Host: "fw.example.com", Port: 22}, {Host: "FW.example.com", Port: 50523}}
+	})
+	for _, v := range List() {
+		if v.Server == "fw.example.com" && !v.Active {
+			t.Fatalf("fw should be active once a node on port 50523 exists: %+v", v)
+		}
+	}
+}
+
+// 只有端口变了（链上加减节点）、IP 不变：rev 更大就换上；同 rev 照旧不换。
+func TestPortsOnlyChange(t *testing.T) {
+	reset(t)
+	Apply(src, ScopeUser, OriginPush, Update{Server: "fw.example.com", IPs: ips("192.0.2.2"), Ports: PortList(50520), Rev: 1})
+	if r := Apply(src, ScopeUser, OriginPush, Update{Server: "fw.example.com", IPs: ips("192.0.2.2"), Ports: PortList(50520, 50523), Rev: 1}); r.Applied {
+		t.Fatal("equal rev must not apply even if ports differ")
+	}
+	if Lookup("fw.example.com", 50523, 0) != nil {
+		t.Fatal("ports changed by an equal rev")
+	}
+	r := Apply(src, ScopeUser, OriginPush, Update{Server: "fw.example.com", IPs: ips("192.0.2.2"), Ports: PortList(50520, 50523), Rev: 2, Reason: "admin"})
+	if !r.Applied || r.Rev != 2 {
+		t.Fatalf("ports-only change = %+v", r)
+	}
+	if Lookup("fw.example.com", 50523, 0) == nil || Lookup("fw.example.com", 50520, 0) == nil {
+		t.Fatal("new ports not used")
+	}
+	// 链上的节点全删了：[]
+	Apply(src, ScopeUser, OriginPush, Update{Server: "fw.example.com", IPs: ips("192.0.2.2"), Ports: PortList(), Rev: 3})
+	if Lookup("fw.example.com", 50520, 0) != nil {
+		t.Fatal("ports [] must stop matching")
+	}
+	// 快照里的端口同样按 rev 换上
+	ApplySnapshot(src, ScopeUser, OriginSnapshot, true, time.Now(), []Update{{Server: "fw.example.com", IPs: ips("192.0.2.2"), Ports: PortList(443), Rev: 4}})
+	if Lookup("fw.example.com", 443, 0) == nil {
+		t.Fatal("snapshot ports not applied")
+	}
+}
+
+// 落盘：缺省（没有 ports 字段）、[]、有端口三种都原样读回；老文件没有 ports 字段 = 缺省。
+func TestPortsPersistence(t *testing.T) {
+	path := reset(t)
+	Apply(src, ScopeUser, OriginPush, Update{Server: "legacy.example.com", IPs: ips("192.0.2.1"), Rev: 1})
+	Apply(src, ScopeUser, OriginPush, Update{Server: "fw.example.com", IPs: ips("192.0.2.2"), Ports: PortList(50523, 50520), Rev: 1})
+	Apply(src, ScopeUser, OriginPush, Update{Server: "empty.example.com", IPs: ips("192.0.2.3"), Ports: PortList(), Rev: 1})
+
+	var raw struct {
+		Entries []map[string]json.RawMessage `json:"entries"`
+	}
+	data, _ := os.ReadFile(path)
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range raw.Entries {
+		var server string
+		_ = json.Unmarshal(e["server"], &server)
+		p, has := e["ports"]
+		switch server {
+		case "legacy.example.com":
+			if has {
+				t.Fatalf("entry without ports persisted ports: %s", p)
+			}
+		case "fw.example.com":
+			if !has || compactJSON(t, p) != "[50520,50523]" {
+				t.Fatalf("fw ports persisted as %s", p)
+			}
+		case "empty.example.com":
+			if !has || compactJSON(t, p) != "[]" {
+				t.Fatalf("empty ports persisted as %q (present %v)", p, has)
+			}
+		}
+	}
+
+	if err := Load(filepath.Join(t.TempDir(), "other.json")); err != nil {
+		t.Fatal(err)
+	}
+	if err := Load(path); err != nil {
+		t.Fatal(err)
+	}
+	if Lookup("legacy.example.com", 8443, 0) == nil {
+		t.Fatal("legacy entry should still match any port after reload")
+	}
+	if Lookup("fw.example.com", 50523, 0) == nil || Lookup("fw.example.com", 22, 0) != nil {
+		t.Fatal("ports not restored")
+	}
+	if Lookup("empty.example.com", 443, 0) != nil {
+		t.Fatal("ports [] not restored as empty")
+	}
+	views := map[string]View{}
+	for _, v := range List() {
+		views[v.Server] = v
+	}
+	if views["legacy.example.com"].Ports != nil || views["empty.example.com"].Ports == nil || len(*views["empty.example.com"].Ports) != 0 ||
+		views["fw.example.com"].Ports == nil || len(*views["fw.example.com"].Ports) != 2 {
+		t.Fatalf("views after reload = %+v", views)
+	}
+
+	// 老版本写的文件：没有 ports 字段
+	old := filepath.Join(t.TempDir(), "old.json")
+	_ = os.WriteFile(old, []byte(`{"version":1,"entries":[{"server":"fw.example.com","ips":["192.0.2.2"],"rev":1,"source":"`+src+`","updatedAt":`+
+		jsonInt(time.Now().UnixMilli())+`,"confirmedAt":`+jsonInt(time.Now().UnixMilli())+`}]}`), 0o600)
+	if err := Load(old); err != nil {
+		t.Fatal(err)
+	}
+	if Lookup("fw.example.com", 22, 0) == nil {
+		t.Fatal("old file without ports must match by server only")
+	}
+}
+
+func compactJSON(t *testing.T, raw json.RawMessage) string {
+	t.Helper()
+	var v any
+	if err := json.Unmarshal(raw, &v); err != nil {
+		t.Fatal(err)
+	}
+	out, _ := json.Marshal(v)
+	return string(out)
+}
+
+func jsonInt(n int64) string {
+	out, _ := json.Marshal(n)
+	return string(out)
+}
+
+// 下线关连接只关端口在入口端口里的节点：同一 server 上另开的直连节点（端口不在 ports 里）不碰，连接表的关闭函数也拿到端口。
+func TestCloseConnectionsRespectsPorts(t *testing.T) {
+	reset(t)
+	const key = "198.51.100.20" // 没设链域名：键 = 入口组首台的地址，和同机直连节点的 server 一样
+	var gotPorts []Ports
+	SetTrackerCloser(func(server string, ports Ports, removed []netip.Addr) int {
+		gotPorts = append(gotPorts, ports)
+		return 0
+	})
+	Apply(src, ScopeUser, OriginPush, Update{Server: key, IPs: ips("198.51.100.20", "198.51.100.21"), Ports: PortList(50520), Rev: 1})
+	fw := newFakeConn()     // 转发节点（端口 50520）拨到 .20
+	direct := newFakeConn() // 直连节点（端口 22）连着 .20：照常 DNS / 字面量，不经覆盖
+	fwUDP := newFakeConn()
+	Track(key, 50520, netip.MustParseAddr("198.51.100.20"), fw)
+	Track(key, 22, netip.MustParseAddr("198.51.100.20"), direct) // 万一登记过（比如以前没有端口时），也不能关
+	if !TrackIP(netip.MustParseAddrPort("198.51.100.20:50520"), fwUDP) {
+		t.Fatal("UDP socket to the entry port should be registered")
+	}
+	if TrackIP(netip.MustParseAddrPort("198.51.100.20:22"), newFakeConn()) {
+		t.Fatal("UDP socket to a port not in ports must not be registered")
+	}
+
+	Apply(src, ScopeUser, OriginPush, Update{Server: key, IPs: ips("198.51.100.21"), Ports: PortList(50520), Rev: 2, Reason: "unload"})
+	if !fw.closed() || !fwUDP.closed() {
+		t.Fatal("forward node connections to the removed IP must be closed")
+	}
+	if direct.closed() {
+		t.Fatal("direct node on the same server (port not in ports) must not be closed")
+	}
+	if len(gotPorts) != 1 || !gotPorts[0].Match(50520) || gotPorts[0].Match(22) {
+		t.Fatalf("tracker closer ports = %+v", gotPorts)
+	}
+
+	// 端口与 IP 同时变：按新旧端口的并集关（旧端口上的连接是经覆盖拨的）
+	old := newFakeConn()
+	Track(key, 50520, netip.MustParseAddr("198.51.100.21"), old)
+	Apply(src, ScopeUser, OriginPush, Update{Server: key, IPs: ips("198.51.100.22"), Ports: PortList(50523), Rev: 3})
+	if !old.closed() || direct.closed() {
+		t.Fatal("union of old and new ports should be used when closing")
 	}
 }

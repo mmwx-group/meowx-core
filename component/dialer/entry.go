@@ -11,8 +11,8 @@ import (
 )
 
 // MeowX：拨主控指定的转发入口（规格 miaomiaowuC/Design/entry-realtime.md §6）。
-// 没指定解析器的拨号就是拨代理节点的 server（见 parseAddr）：入口覆盖表里有这个 server 时直接用表里的 IP，
-// 不查 hosts 与 DNS；TLS SNI、Host、端口都不变——这里换的只是 TCP / UDP 连到哪个 IP。
+// 没指定解析器的拨号就是拨代理节点的 server（见 parseAddr）：入口覆盖表里有这个 server、且端口在入口端口里时
+// 直接用表里的 IP，不查 hosts 与 DNS（同机另开的直连节点 server 相同、端口不同，照常解析）；TLS SNI、Host、端口都不变——这里换的只是 TCP / UDP 连到哪个 IP。
 
 // networkFamily tcp4 / udp4 只要 IPv4，tcp6 / udp6 只要 IPv6，别的两种都要。
 func networkFamily(network string) int {
@@ -61,7 +61,7 @@ func dialEntry(ctx context.Context, network, host string, ips []netip.Addr, port
 		conn, err := dialContext(attemptCtx, network, ip, port, opt)
 		cancel()
 		if err == nil {
-			entryoverride.Track(host, ip, conn)
+			entryoverride.Track(host, entryoverride.PortOf(port), ip, conn)
 			return conn, nil
 		}
 		errs = append(errs, err)
@@ -75,16 +75,16 @@ func dialEntry(ctx context.Context, network, host string, ips []netip.Addr, port
 	return nil, errors.Join(errs...)
 }
 
-// trackEntryLiteral 拨的地址本身就是 IP、且是某个入口当前集合里的 IP：按 IP 登记。
+// trackEntryLiteral 拨的地址本身就是 IP、且是某个入口当前集合里的 IP（端口也对得上入口端口）：按 IP 登记。
 func trackEntryLiteral(ctx context.Context, address string, conn net.Conn) {
 	if !entryoverride.Active() || entryoverride.InEntryDial(ctx) {
 		return
 	}
-	host, _, err := net.SplitHostPort(address)
+	host, port, err := net.SplitHostPort(address)
 	if err != nil {
 		return
 	}
 	if ip, err := netip.ParseAddr(host); err == nil {
-		entryoverride.TrackIP(ip, conn)
+		entryoverride.TrackIP(netip.AddrPortFrom(ip, entryoverride.PortOf(port)), conn)
 	}
 }

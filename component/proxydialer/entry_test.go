@@ -38,7 +38,7 @@ func TestProxyDialerUsesEntryOverride(t *testing.T) {
 	if err := entryoverride.Load(filepath.Join(t.TempDir(), "entry-overrides.json")); err != nil {
 		t.Fatal(err)
 	}
-	entryoverride.SetServerSource(func() []string { return []string{"chained-entry.test"} })
+	entryoverride.SetServerSource(func() []entryoverride.Server { return []entryoverride.Server{{Host: "chained-entry.test"}} })
 	defer entryoverride.SetServerSource(nil)
 	apply := func(rev int64, list ...string) {
 		var addrs []netip.Addr

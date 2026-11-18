@@ -1,7 +1,10 @@
 package panelrt
 
 import (
+	"encoding/json"
+	"net"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -33,12 +36,21 @@ func TestMain(m *testing.M) {
 	os.Exit(m.Run())
 }
 
-// setup 每个用例一个新的数据目录（入口覆盖表与订阅 rev 都从空开始），只认 servers 这几个节点 server。
+// setup 每个用例一个新的数据目录（入口覆盖表与订阅 rev 都从空开始），只认 servers 这几个节点 server（可写成 host:port）。
 func setup(t *testing.T, servers ...string) {
 	t.Helper()
 	C.SetHomeDir(t.TempDir())
 	ensureState()
-	entryoverride.SetServerSource(func() []string { return servers })
+	list := make([]entryoverride.Server, 0, len(servers))
+	for _, s := range servers {
+		// 「host:port」= 带端口的节点（入口端口匹配用），只写 host = 端口不知道
+		if h, port, err := net.SplitHostPort(s); err == nil {
+			list = append(list, entryoverride.Server{Host: h, Port: entryoverride.PortOf(port)})
+		} else {
+			list = append(list, entryoverride.Server{Host: s})
+		}
+	}
+	entryoverride.SetServerSource(func() []entryoverride.Server { return list })
 	t.Cleanup(func() {
 		Stop()
 		SetSubscriptionCallback(nil)
@@ -89,8 +101,8 @@ func TestRealtimeEntryFailoverAndAck(t *testing.T) {
 	if err := Configure([]Channel{{Base: p.base + "/", Token: "good"}}, nil); err != nil {
 		t.Fatal(err)
 	}
-	waitFor(t, 3*time.Second, "hk.test override", func() bool { return len(entryoverride.Lookup("hk.test", 0)) == 2 })
-	if got := entryoverride.Lookup("legacy.test", 0); len(got) != 1 || got[0].String() != "203.0.113.10" {
+	waitFor(t, 3*time.Second, "hk.test override", func() bool { return len(entryoverride.Lookup("hk.test", 0, 0)) == 2 })
+	if got := entryoverride.Lookup("legacy.test", 0, 0); len(got) != 1 || got[0].String() != "203.0.113.10" {
 		t.Fatalf("legacy push = %v", got)
 	}
 	waitFor(t, 3*time.Second, "ack + ping", func() bool {
@@ -155,20 +167,98 @@ func TestRealtimeSnapshotReady(t *testing.T) {
 	if err := Configure([]Channel{{Base: p.base, Token: "good"}}, nil); err != nil {
 		t.Fatal(err)
 	}
-	waitFor(t, 3*time.Second, "a.test", func() bool { return entryoverride.Lookup("a.test", 0) != nil })
-	if entryoverride.Lookup("stale.test", 0) == nil {
+	waitFor(t, 3*time.Second, "a.test", func() bool { return entryoverride.Lookup("a.test", 0, 0) != nil })
+	if entryoverride.Lookup("stale.test", 0, 0) == nil {
 		t.Fatal("ready:false snapshot cleared an entry")
 	}
 	close(step)
-	waitFor(t, 3*time.Second, "b.test", func() bool { return entryoverride.Lookup("b.test", 0) != nil })
-	waitFor(t, 3*time.Second, "stale cleared", func() bool { return entryoverride.Lookup("stale.test", 0) == nil })
-	if entryoverride.Lookup("other.test", 0) == nil {
+	waitFor(t, 3*time.Second, "b.test", func() bool { return entryoverride.Lookup("b.test", 0, 0) != nil })
+	waitFor(t, 3*time.Second, "stale cleared", func() bool { return entryoverride.Lookup("stale.test", 0, 0) == nil })
+	if entryoverride.Lookup("other.test", 0, 0) == nil {
 		t.Fatal("snapshot from one panel cleared another panel's entry")
 	}
 	waitFor(t, 3*time.Second, "acks", func() bool {
 		_, up, _, _ := p.snapshot()
 		return hasUplink(up, "entry_ack", 1, 100) && hasUplink(up, "entry_ack", 2, 200)
 	})
+}
+
+// 入口端口（规格 §1 / §2.2）：有 ports 时只认 server 等于键且端口在里面的节点；[] 不匹配任何节点；
+// 没有这个字段（老主控）只比 server；只有端口变的推送（新 rev）照样换上；GET /meowx/entries 的 JSON 区分缺省与 []。
+func TestRealtimeEntryPorts(t *testing.T) {
+	setup(t, "fw.test:50520", "fw.test:22", "empty.test:443", "legacy.test:443")
+	p := newFakePanel(t)
+	p.tokens["good"] = true
+	step := make(chan struct{})
+	p.onConnect = func(c *fakeWS) {
+		_ = c.send(map[string]any{"type": "entry_snapshot", "ready": true, "entries": []any{
+			map[string]any{"server": "fw.test", "chainId": 1, "ips": []string{"192.0.2.1"}, "rev": 100, "ports": []int{50520}},
+			map[string]any{"server": "empty.test", "chainId": 2, "ips": []string{"192.0.2.2"}, "rev": 100, "ports": []int{}},
+			map[string]any{"server": "legacy.test", "chainId": 3, "ips": []string{"192.0.2.3"}, "rev": 100}}})
+		<-step
+		// 链上加了节点：IP 不变、只有端口变（端口也可能是数字字符串，容一手）
+		_ = c.send(map[string]any{"type": "entry_failover", "domain": "fw.test", "healthyIPs": []string{"192.0.2.1"},
+			"chainId": 1, "rev": 200, "reason": "admin", "ports": []any{50520, "50523"}})
+	}
+	if err := Configure([]Channel{{Base: p.base, Token: "good"}}, nil); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 3*time.Second, "fw.test", func() bool { return entryoverride.Lookup("fw.test", 50520, 0) != nil })
+	if entryoverride.Lookup("fw.test", 22, 0) != nil {
+		t.Fatal("direct node on the same server (port not in ports) must not use the override")
+	}
+	if entryoverride.Lookup("empty.test", 443, 0) != nil {
+		t.Fatal("ports [] must match no node")
+	}
+	if entryoverride.Lookup("legacy.test", 443, 0) == nil || entryoverride.Lookup("legacy.test", 8443, 0) == nil {
+		t.Fatal("entry without ports (old panel) must match by server only")
+	}
+	views := map[string]entryoverride.View{}
+	for _, v := range Entries() {
+		views[v.Server] = v
+	}
+	data, _ := json.Marshal(map[string]any{"entries": Entries()})
+	if !strings.Contains(string(data), `"ports":[50520]`) || !strings.Contains(string(data), `"ports":[]`) {
+		t.Fatalf("entries JSON = %s", data)
+	}
+	if views["legacy.test"].Ports != nil || !views["fw.test"].Active || views["empty.test"].Active || !views["legacy.test"].Active {
+		t.Fatalf("views = %+v", views)
+	}
+	close(step)
+	waitFor(t, 3*time.Second, "ports-only push", func() bool { return entryoverride.Lookup("fw.test", 50523, 0) != nil })
+	if entryoverride.Lookup("fw.test", 22, 0) != nil {
+		t.Fatal("direct node must still be excluded after the ports update")
+	}
+	waitFor(t, 3*time.Second, "ack", func() bool {
+		_, up, _, _ := p.snapshot()
+		return hasUplink(up, "entry_ack", 1, 200)
+	})
+}
+
+func TestParsePorts(t *testing.T) {
+	if got := parsePorts(nil); got.Set {
+		t.Fatalf("missing field = %+v", got)
+	}
+	raw := func(s string) *[]json.RawMessage {
+		var list []json.RawMessage
+		if err := json.Unmarshal([]byte(s), &list); err != nil {
+			t.Fatal(err)
+		}
+		return &list
+	}
+	if got := parsePorts(raw(`[]`)); !got.Set || len(got.List) != 0 {
+		t.Fatalf("[] = %+v", got)
+	}
+	if got := parsePorts(raw(`[50523, "50520", 50523, 0, 70000, "x", null]`)); !got.Set || len(got.List) != 2 || got.List[0] != 50520 || got.List[1] != 50523 {
+		t.Fatalf("mixed = %+v", got)
+	}
+	var m message
+	if err := json.Unmarshal([]byte(`{"type":"entry_failover","domain":"a","healthyIPs":[]}`), &m); err != nil || m.Ports != nil {
+		t.Fatalf("absent ports decoded as %v (%v)", m.Ports, err)
+	}
+	if err := json.Unmarshal([]byte(`{"type":"entry_failover","ports":[]}`), &m); err != nil || m.Ports == nil || len(*m.Ports) != 0 {
+		t.Fatalf("empty ports decoded as %v (%v)", m.Ports, err)
+	}
 }
 
 func TestRealtimeSubscriptionChanged(t *testing.T) {
@@ -282,7 +372,7 @@ func TestRealtimeReconnect(t *testing.T) {
 		t.Fatalf("normal disconnects counted as auth failure: %+v", st)
 	}
 	waitFor(t, 3*time.Second, "latest snapshot applied", func() bool {
-		got := entryoverride.Lookup("r.test", 0)
+		got := entryoverride.Lookup("r.test", 0, 0)
 		return len(got) == 1 && got[0].String() != "192.0.2.1"
 	})
 }
@@ -299,7 +389,7 @@ func TestRealtimePullWhenWSDown(t *testing.T) {
 	if err := Configure([]Channel{{Base: p.base, RT: "ro-cred"}}, nil); err != nil {
 		t.Fatal(err)
 	}
-	waitFor(t, 3*time.Second, "pulled entry", func() bool { return entryoverride.Lookup("pull.test", 0) != nil })
+	waitFor(t, 3*time.Second, "pulled entry", func() bool { return entryoverride.Lookup("pull.test", 0, 0) != nil })
 	waitFor(t, 3*time.Second, "pulled sub rev", func() bool { return len(events()) == 1 })
 	if e := events()[0]; e.key != "pkg:1" || e.rev != "p1" {
 		t.Fatalf("event = %+v", e)

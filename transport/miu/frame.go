@@ -1,46 +1,35 @@
-// Package miu implements the client side of the Miu protocol, second version: a
-// pool of lanes with pass-through.
-//
-//   - A lane is one TCP connection + the outer TLS / REALITY + one authentication.
-//     It carries one stream at a time and goes back to the pool when that stream
-//     ended, so a stream on a warm lane starts without a handshake or a round
-//     trip. Nothing is multiplexed: no flow control windows, no stream holding
-//     back another, backpressure is left to TCP.
-//   - Inner data that already is TLS 1.3 ciphertext is not encrypted a second
-//     time: a RAW frame announces a byte count and the bytes follow as they are
-//     on the TCP connection.
-//   - The first packets of every stream are shaped by the padding scheme, UDP
-//     rides a stream as UoT.
-//
-// The wire format is PROTOCOL.md of the miu repository. The first version (the
-// AnyTLS frame format with MUX and the Vision handover) is kept at the tag miu-v1.
 package miu
 
-// Frames, all of them inside outer TLS records:
-//
-//	type(1) | len(u16) | payload
+import (
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+)
+
+// Frames travel inside outer TLS records: type(1) · len(u16 BE) · payload.
 const (
-	frPad            = 0 // padding, dropped
-	frSettings       = 1 // client to server, text
-	frServerSettings = 2 // server to client, text
-	frUpdatePadding  = 3 // server to client, padding scheme text
-	frOpen           = 4 // client to server, the destination as socksaddr
-	frData           = 5 // data, encrypted by the outer TLS only
-	frRaw            = 6 // u32 BE = N: N bytes follow on the TCP connection outside the outer TLS. Last frame of its record
-	frEnd            = 7 // this direction is done
-	frReset          = 8 // client to server: the stream is aborted, the uplink is done, stop the downlink and send END
+	frPad            = 0 // padding, discarded
+	frSettings       = 1 // C→S text
+	frServerSettings = 2 // S→C text
+	frUpdatePadding  = 3 // S→C padding scheme text
+	frOpen           = 4 // C→S socksAddr destination
+	frData           = 5 // payload, encrypted once by the outer TLS
+	frRaw            = 6 // u32 BE = N: N bytes follow on TCP outside the outer TLS. Last frame of its record
+	frEnd            = 7 // this direction is finished
+	frReset          = 8 // C→S abort the stream: the uplink ends here, stop the downlink and send END
 
 	frameHead = 3
-	// a DATA frame with its header fits one TLS record
+	// maxData keeps one DATA frame, header included, inside a single TLS record.
 	maxData = 16000
-	// upper bound of one raw segment
+	// maxBatch is the largest batch of payload sent as one "packet" while a stream is in its DATA phase.
+	maxBatch = 2 * maxData
+	// maxSeg is the upper bound of one raw segment.
 	maxSeg = 1 << 20
-	// Past the inner handshake a batch smaller than this still goes as DATA: the
-	// RAW frame takes a record of its own, for little data that doubles the
-	// packets and the encryption saved is not worth it.
+	// rawMin: in the raw phase a batch smaller than this still goes out as DATA. A RAW frame needs a record
+	// (and usually a packet) of its own, which doubles the packet count for small writes.
 	rawMin = 4096
-	// how far into a direction the inner TLS handshake is looked for, a stream
-	// without one by then stays in DATA frames
+	// sniffLimit is how far into a direction the inner TLS handshake is looked for before giving up.
 	sniffLimit = 64 << 10
 )
 
@@ -49,29 +38,59 @@ func appendFrame(b []byte, typ byte, payload []byte) []byte {
 	return append(b, payload...)
 }
 
-// appendData appends p as DATA frames.
-func appendData(b []byte, p []byte) []byte {
+// appendData encodes p as DATA frames of at most maxData bytes each.
+func appendData(dst, p []byte) []byte {
 	for len(p) > 0 {
-		k := len(p)
-		if k > maxData {
-			k = maxData
-		}
-		b = appendFrame(b, frData, p[:k])
+		k := minInt(len(p), maxData)
+		dst = appendFrame(dst, frData, p[:k])
 		p = p[k:]
+	}
+	return dst
+}
+
+// minInt is the builtin min of Go 1.21. This package keeps to the language and library of Go 1.20,
+// so that it can be copied into projects that still build with it.
+func minInt(a, b int) int {
+	if a < b {
+		return a
 	}
 	return b
 }
 
-// appendPad appends a PAD frame with n bytes of payload.
-func appendPad(b []byte, n int) []byte {
-	b = append(b, frPad, byte(n>>8), byte(n))
-	return append(b, make([]byte, n)...)
+// parseKV parses a settings text: newline separated key=value pairs.
+func parseKV(text string) map[string]string {
+	m := make(map[string]string)
+	for _, line := range strings.Split(text, "\n") {
+		line = strings.TrimSpace(line)
+		if k, v, ok := strings.Cut(line, "="); ok {
+			m[k] = v
+		}
+	}
+	return m
 }
 
-// protoError is a violation of the wire format by the server, as opposed to a
-// lane that just died.
-type protoError string
+func kvInt(m map[string]string, key string) (int64, bool) {
+	v, ok := m[key]
+	if !ok {
+		return 0, false
+	}
+	n, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64)
+	return n, err == nil
+}
 
-func (e protoError) Error() string {
-	return "miu: " + string(e)
+// bufSize is the size of the pooled scratch buffers used to move payload around.
+const bufSize = 32 << 10
+
+var bufPool = sync.Pool{New: func() any { b := make([]byte, bufSize); return &b }}
+
+func getBuf() *[]byte  { return bufPool.Get().(*[]byte) }
+func putBuf(b *[]byte) { bufPool.Put(b) }
+
+// testObserver is only set by tests, to assert which code path was taken.
+var testObserver atomic.Pointer[func(event string)]
+
+func observe(event string) {
+	if f := testObserver.Load(); f != nil {
+		(*f)(event)
+	}
 }

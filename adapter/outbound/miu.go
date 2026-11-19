@@ -1,33 +1,31 @@
 package outbound
 
 import (
-	"bufio"
 	"context"
+	stdtls "crypto/tls"
 	"errors"
 	"net"
 	"strconv"
 	"strings"
 	"time"
 
-	N "github.com/metacubex/mihomo/common/net"
-	"github.com/metacubex/mihomo/common/utils"
-	"github.com/metacubex/mihomo/component/proxydialer"
+	"github.com/metacubex/mihomo/common/once"
+	tlsC "github.com/metacubex/mihomo/component/tls"
 	C "github.com/metacubex/mihomo/constant"
+	"github.com/metacubex/mihomo/log"
 	"github.com/metacubex/mihomo/transport/miu"
 	"github.com/metacubex/mihomo/transport/vmess"
 
-	M "github.com/metacubex/sing/common/metadata"
-	"github.com/metacubex/sing/common/uot"
+	"github.com/metacubex/tls"
 )
 
 type Miu struct {
 	*Base
-	client *miu.Client
-	option *MiuOption
+	client    *miu.Client
+	option    *MiuOption
+	tlsConfig *vmess.TLSConfig
 }
 
-// MiuOption: vision, recv-window, client-metadata and idle-session-check-interval
-// are options of the first version of the protocol, still accepted and ignored.
 type MiuOption struct {
 	BasicOption
 	Name                     string         `proxy:"name"`
@@ -47,78 +45,87 @@ type MiuOption struct {
 	Certificate              string         `proxy:"certificate,omitempty"`
 	PrivateKey               string         `proxy:"private-key,omitempty"`
 	UDP                      bool           `proxy:"udp,omitempty"`
-	Vision                   bool           `proxy:"vision,omitempty"`
-	RecvWindow               int            `proxy:"recv-window,omitempty"`
+	Vision                   bool           `proxy:"vision,omitempty"`      // 兼容字段，Miu 第二版不用
+	RecvWindow               int            `proxy:"recv-window,omitempty"` // 兼容字段，Miu 第二版不用
 	ClientMetadata           string         `proxy:"client-metadata,omitempty"`
-	IdleSessionCheckInterval int            `proxy:"idle-session-check-interval,omitempty"`
+	IdleSessionCheckInterval int            `proxy:"idle-session-check-interval,omitempty"` // 兼容字段
 	IdleSessionTimeout       int            `proxy:"idle-session-timeout,omitempty"`
 	MinIdleSession           int            `proxy:"min-idle-session,omitempty"`
 }
 
-func (t *Miu) DialContext(ctx context.Context, metadata *C.Metadata) (_ C.Conn, err error) {
-	c, err := t.client.CreateProxy(ctx, M.ParseSocksaddrHostPort(metadata.String(), metadata.DstPort))
+// DialContext implements C.ProxyAdapter
+func (m *Miu) DialContext(ctx context.Context, metadata *C.Metadata) (C.Conn, error) {
+	// 目标原样发给服务端：域名在服务端解析。
+	c, err := m.client.DialContext(ctx, "tcp", metadata.RemoteAddress())
 	if err != nil {
 		return nil, err
 	}
-	return NewConn(c, t), nil
+	return NewConn(c, m), nil
 }
 
-func (t *Miu) ListenPacketContext(ctx context.Context, metadata *C.Metadata) (_ C.PacketConn, err error) {
-	if err = t.ResolveUDP(ctx, metadata); err != nil {
+// ListenPacketContext implements C.ProxyAdapter
+func (m *Miu) ListenPacketContext(ctx context.Context, metadata *C.Metadata) (C.PacketConn, error) {
+	if err := m.ResolveUDP(ctx, metadata); err != nil {
 		return nil, err
 	}
-
-	// UDP rides a stream of its own
-	c, err := t.client.CreateProxy(ctx, uot.RequestDestination(2))
+	// 一条 UoT 流，独占一条通道，首个数据包写出时开。
+	pc, err := m.client.ListenPacket()
 	if err != nil {
 		return nil, err
 	}
-
-	// create uot on tcp
-	destination := M.SocksaddrFromNet(metadata.UDPAddr())
-	pc := N.NewThreadSafePacketConn(uot.NewLazyConn(&miuBufferedConn{Conn: c, r: bufio.NewReaderSize(c, 32<<10)}, uot.Request{Destination: destination}))
-	return newMiuPacketConn(pc, t), nil
-}
-
-// miuBufferedConn gives the UoT reader a buffer: it reads every packet field by
-// field (address family, address, port, length, payload), and each of those was
-// a trip through the whole read path of the stream.
-type miuBufferedConn struct {
-	net.Conn
-	r *bufio.Reader
-}
-
-func (c *miuBufferedConn) Read(p []byte) (int, error) { return c.r.Read(p) }
-
-// newMiuPacketConn is NewPacketConn without the deadline wrapper. The tunnel sets
-// a read deadline before every packet, and the wrapper then runs each read in a
-// new goroutine (the stack growth of those alone was a fifth of the CPU of a UDP
-// download). A Miu stream handles read deadlines itself. A deadline firing in the
-// middle of a packet would leave the UoT stream out of step, but the tunnel only
-// sets the session timeout, which runs out while waiting for the next packet,
-// and the session is over then anyway.
-func newMiuPacketConn(pc net.PacketConn, a ProxyAdapter) C.PacketConn {
-	cpc := &packetConn{N.NewEnhancePacketConn(pc), nil, nil, a.Name(), utils.NewUUIDV4().String(), a.Addr(), a.ResolveUDP}
-	cpc.AppendToChains(a)
-	return cpc
+	return NewPacketConn(pc, m), nil
 }
 
 // SupportUOT implements C.ProxyAdapter
-func (t *Miu) SupportUOT() bool {
+func (m *Miu) SupportUOT() bool {
 	return true
 }
 
 // ProxyInfo implements C.ProxyAdapter
-func (t *Miu) ProxyInfo() C.ProxyInfo {
-	info := t.Base.ProxyInfo()
-	info.DialerProxy = t.option.DialerProxy
+func (m *Miu) ProxyInfo() C.ProxyInfo {
+	info := m.Base.ProxyInfo()
+	info.DialerProxy = m.option.DialerProxy
 	return info
 }
 
 // Close implements C.ProxyAdapter
-func (t *Miu) Close() error {
-	return t.client.Close()
+func (m *Miu) Close() error {
+	return m.client.Close()
 }
+
+// dialLane 开一条通道的外层连接：经代理拨号器 TCP，再 TLS / uTLS / REALITY。TLS 连接原样返回、不加任何包装，
+// miu 库要伸进去取裸段。
+func (m *Miu) dialLane(ctx context.Context) (net.Conn, error) {
+	conn, err := m.dialer.DialContext(ctx, "tcp", m.addr)
+	if err != nil {
+		return nil, err
+	}
+	tlsConn, err := vmess.StreamTLSConn(ctx, conn, m.tlsConfig)
+	if err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	return tlsConn, nil
+}
+
+// miuRawUsable 一次性自检：裸段在 vmess.StreamTLSConn 这里能返回的两种 TLS 连接上都能用——metacubex/tls 的
+// *tls.Conn 和 metacubex/utls 的 *utls.UConn（REALITY 握手也产出后者）。
+var miuRawUsable = once.OnceValue(func() bool {
+	err := miu.SelfTest(func(conn net.Conn, cfg *stdtls.Config) net.Conn {
+		return tls.Client(conn, &tls.Config{ServerName: cfg.ServerName, InsecureSkipVerify: true, MinVersion: tls.VersionTLS13})
+	})
+	if err == nil {
+		err = miu.SelfTest(func(conn net.Conn, cfg *stdtls.Config) net.Conn {
+			chrome, _ := tlsC.GetFingerprint("chrome")
+			return tlsC.UClient(conn, &tlsC.Config{ServerName: cfg.ServerName, InsecureSkipVerify: true, MinVersion: tlsC.VersionTLS13}, chrome)
+		})
+	}
+	if err != nil {
+		log.Warnln("Miu: raw segments are not usable with this build, continuing without them: %v", err)
+		return false
+	}
+	return true
+})
 
 func NewMiu(option MiuOption) (*Miu, error) {
 	addr := net.JoinHostPort(option.Server, strconv.Itoa(option.Port))
@@ -138,7 +145,6 @@ func NewMiu(option MiuOption) (*Miu, error) {
 		option: &option,
 	}
 	outbound.dialer = option.NewDialer(outbound.DialOptions())
-	singDialer := proxydialer.NewSingDialer(outbound.dialer)
 
 	echConfig, err := option.ECHOpts.Parse()
 	if err != nil {
@@ -151,8 +157,15 @@ func NewMiu(option MiuOption) (*Miu, error) {
 	if realityConfig != nil && option.ClientFingerprint == "" {
 		return nil, errors.New("REALITY is based on uTLS, please set a client-fingerprint")
 	}
-	tlsConfig := &vmess.TLSConfig{
-		Host:              option.SNI,
+	sni := option.SNI
+	if sni == "" {
+		sni = option.ServerName
+	}
+	if sni == "" {
+		sni = option.Server
+	}
+	outbound.tlsConfig = &vmess.TLSConfig{
+		Host:              sni,
 		SkipCertVerify:    option.SkipCertVerify,
 		NameCertVerify:    option.NameCertVerify,
 		NextProtos:        option.ALPN,
@@ -163,26 +176,17 @@ func NewMiu(option MiuOption) (*Miu, error) {
 		ECH:               echConfig,
 		Reality:           realityConfig,
 	}
-	if tlsConfig.Host == "" {
-		tlsConfig.Host = option.ServerName
-	}
-	if tlsConfig.Host == "" {
-		tlsConfig.Host = option.Server
-	}
 
-	client, err := miu.NewClient(context.TODO(), miu.ClientConfig{
-		PSK:                option.PSK,
-		PaddingScheme:      strings.Join(option.PaddingScheme, "\n"),
-		IdleSessionTimeout: time.Duration(option.IdleSessionTimeout) * time.Second,
-		MinIdleSession:     option.MinIdleSession,
-		Server:             M.ParseSocksaddrHostPort(option.Server, uint16(option.Port)),
-		Dialer:             singDialer,
-		TLSConfig:          tlsConfig,
+	outbound.client, err = miu.NewClient(miu.ClientConfig{
+		PSK:           option.PSK,
+		Dial:          outbound.dialLane,
+		LaneIdle:      time.Duration(option.IdleSessionTimeout) * time.Second,
+		MinIdle:       option.MinIdleSession,
+		DisableRaw:    !miuRawUsable(),
+		PaddingScheme: strings.Join(option.PaddingScheme, "\n"),
 	})
 	if err != nil {
 		return nil, err
 	}
-	outbound.client = client
-
 	return outbound, nil
 }

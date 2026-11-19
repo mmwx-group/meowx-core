@@ -3,196 +3,365 @@ package miu
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
+	"fmt"
+	"io"
 	"net"
-	"reflect"
-	"strconv"
-	"strings"
+	"sync"
 	"sync/atomic"
-	"unsafe"
+	"time"
 
-	tlsC "github.com/metacubex/mihomo/component/tls"
-	"github.com/metacubex/mihomo/transport/anytls/padding"
-	"github.com/metacubex/mihomo/transport/anytls/util"
-
-	"github.com/metacubex/tls"
+	mrand "math/rand"
 )
 
-// lane is one TCP connection + the outer TLS + one authentication. It carries one
-// stream at a time and goes back to the pool when that stream ended.
+// lane is one authenticated connection: a TCP connection, the outer TLS on top of it, and one
+// authentication. It carries a single stream at a time and goes back to the pool when that stream ends.
 //
-// Two things alternate on it: frames inside outer TLS records, and behind a RAW
-// frame a raw segment written to the TCP connection as is. Reads and writes each
-// come from one goroutine at a time, the stream sees to that.
+// Two things alternate on a lane: frames inside outer TLS records, and raw segments, bytes that follow a
+// RAW frame directly on TCP without going through the outer TLS (inner data that already is TLS 1.3
+// ciphertext is not encrypted a second time). Each side of a lane is read by one goroutine at a time;
+// writes are serialized by wmu.
 type lane struct {
-	c    *Client
-	conn net.Conn // the outer TLS connection: frames
-	raw  net.Conn // the connection below it: raw segments, and the liveness peek
-
-	// buffers inside conn, see tlsBuffers
-	in  *bytes.Reader
-	rin *bytes.Buffer
-
-	// canRaw: this end can take and send raw segments (the outer layer is a TLS
-	// connection we can reach into). peerRaw: the server announced it takes them.
+	conn net.Conn // frames
+	sock net.Conn // the socket under conn (conn itself when the outer layer is not TLS): raw segments, liveness probe
+	in   *bytes.Reader
+	rin  *bytes.Buffer
+	// canRaw: this side can enter and leave raw segments (the outer layer is a Go TLS connection whose
+	// buffers are reachable). peerRaw: the peer has declared raw=1 in its settings.
 	canRaw  bool
 	peerRaw atomic.Bool
-	// seconds the server keeps an idle lane, from ServerSettings
+	server  bool
+	client  *Client
+
+	wmu sync.Mutex
+	// prefix is written at the very start of the next write, in the same record: the client's
+	// authentication header and Settings on a lane dialed for a stream, the server's ServerSettings.
+	// prefixTimer writes it alone if nothing else is written in time. Guarded by wmu.
+	prefix      []byte
+	prefixTimer *time.Timer
+	// sent counts the packets written on the lane in its sending direction (writeLanePacket): only the
+	// lane's first ones are shaped, whatever stream they belong to. Guarded by wmu.
+	sent uint32
+	// idle is how long the server keeps this lane without a stream (server only; jittered per lane).
+	idle time.Duration
+	// Client only. unauthed: the authentication header is still in prefix (the lane has not been used
+	// yet); preauthTTL is how long such a lane may wait in the pool, below the server's handshake
+	// timeout; idleScale spreads the idle time of the used lane.
+	unauthed   atomic.Bool
+	preauthTTL time.Duration
+	idleScale  float64
+	// base is the scheme whose md5 is exchanged in Settings: the PSK-derived one or an explicit one. The
+	// lane shapes with scheme, which is its own draw from base's family when base is derived.
+	base *paddingScheme
+
+	scheme atomic.Pointer[paddingScheme]
+	closed atomic.Bool
+	done   chan struct{} // closed by close
+
+	// peerIdle is how many seconds the server keeps an idle lane (client side).
 	peerIdle atomic.Int64
 
-	// taken out of the pool, so it may have died there unnoticed
-	pooled bool
-	// It carried a stream: ServerSettings is read and nothing may arrive while
-	// it is idle. A prewarmed lane still has ServerSettings on its way in.
-	used   bool
-	closed atomic.Bool
+	// Read cursor. A read that fails with a timeout leaves it intact, so the read can be retried.
+	head     [frameHead]byte
+	headN    int
+	body     []byte // payload of the frame being gathered (everything except DATA and raw bytes)
+	bodyN    int
+	dataLeft int   // unread bytes of the current DATA frame
+	rawLeft  int64 // unread bytes of the current raw segment
 }
 
-// tlsBuffers reaches into the outer TLS connection the way XTLS-Vision does
-// (reflect + unsafe): input holds what is decrypted and not read yet, rawInput
-// what came off the socket and is not parsed yet, raw is the connection below.
-// Standard TLS is a *tls.Conn, uTLS and REALITY are a *tlsC.UConn.
-func tlsBuffers(conn net.Conn) (raw net.Conn, input *bytes.Reader, rawInput *bytes.Buffer, ok bool) {
-	var t reflect.Type
-	var p unsafe.Pointer
-	switch c := conn.(type) {
-	case *tls.Conn:
-		raw, t, p = c.NetConn(), reflect.TypeOf(c).Elem(), unsafe.Pointer(c)
-	case *tlsC.Conn:
-		raw, t, p = c.NetConn(), reflect.TypeOf(c).Elem(), unsafe.Pointer(c)
-	case *tlsC.UConn:
-		raw, t, p = c.NetConn(), reflect.TypeOf(c.Conn).Elem(), unsafe.Pointer(c.Conn)
-	default:
-		return nil, nil, nil, false
-	}
-	i, ok1 := t.FieldByName("input")
-	r, ok2 := t.FieldByName("rawInput")
-	if raw == nil || p == nil || !ok1 || !ok2 ||
-		i.Type != reflect.TypeOf(bytes.Reader{}) || r.Type != reflect.TypeOf(bytes.Buffer{}) {
-		return nil, nil, nil, false
-	}
-	return raw, (*bytes.Reader)(unsafe.Add(p, i.Offset)), (*bytes.Buffer)(unsafe.Add(p, r.Offset)), true
-}
-
-func newLane(c *Client, conn net.Conn) *lane {
-	l := &lane{c: c, conn: conn, raw: conn}
-	if raw, in, rin, ok := tlsBuffers(conn); ok {
-		l.raw, l.in, l.rin, l.canRaw = raw, in, rin, true
+func newLane(conn net.Conn, server, allowRaw bool) *lane {
+	l := &lane{conn: conn, sock: conn, server: server, done: make(chan struct{})}
+	l.scheme.Store(defaultScheme)
+	if in, rin, sock, ok := tlsBuffers(conn); ok {
+		l.sock = sock
+		if allowRaw {
+			l.in, l.rin, l.canRaw = in, rin, true
+		}
 	}
 	return l
 }
 
 func (l *lane) close() {
 	if l.closed.CompareAndSwap(false, true) {
-		_ = l.conn.Close()
+		close(l.done)
+		l.conn.Close()
 	}
 }
 
-// settings is the payload of the Settings frame.
-func (l *lane) settings(paddingMd5 string) []byte {
-	raw := "0"
-	if l.canRaw {
-		raw = "1"
+func (l *lane) event(name string) {
+	if testObserver.Load() == nil {
+		return
 	}
-	return []byte("v=2\nraw=" + raw + "\npadding-md5=" + paddingMd5)
+	if l.server {
+		observe("server:" + name)
+	} else {
+		observe("client:" + name)
+	}
 }
 
-// control handles the frames that belong to no stream. They may show up anywhere.
-func (l *lane) control(typ byte, payload []byte) error {
-	switch typ {
-	case frPad:
-	case frServerSettings:
-		m := util.StringMapFromBytes(payload)
-		l.peerRaw.Store(strings.TrimSpace(m["raw"]) == "1")
-		if idle, err := strconv.ParseInt(strings.TrimSpace(m["idle"]), 10, 64); err == nil && idle > 0 {
-			l.peerIdle.Store(idle)
-		}
-	case frUpdatePadding:
-		padding.UpdatePaddingScheme(payload, &l.c.padding)
-	default:
-		return protoError("unexpected frame type " + strconv.Itoa(int(typ)))
-	}
-	return nil
-}
+// ---- reading ----
 
-// ---- read ----
-//
-// Frames are read on demand and never ahead: entering and leaving a raw segment
-// needs the read position to line up with the TLS records, a buffered reader
-// would swallow the raw bytes behind a RAW frame as if they were TLS plaintext.
-
-// readMore fills b from the outer TLS connection, *n bytes of it are there
-// already. It can be resumed after a timeout.
-func (l *lane) readMore(b []byte, n *int) error {
-	for *n < len(b) {
-		k, err := l.conn.Read(b[*n:])
-		*n += k
-		if err != nil && *n < len(b) {
+// fill reads into p until *got reaches len(p). Progress survives an error.
+// Frames are read on demand, never ahead: entering a raw segment requires the read position to line up
+// with the TLS records.
+func (l *lane) fill(p []byte, got *int) error {
+	for *got < len(p) {
+		n, err := l.conn.Read(p[*got:])
+		*got += n
+		if err != nil && *got < len(p) {
 			return err
 		}
 	}
 	return nil
 }
 
-// readRawLen finishes the body (u32) of a RAW frame, head holds the frame header
-// and *n counts the bytes read so far.
+// next reads up to the next frame the caller has to act on and returns its type.
 //
-// RAW is the last frame of its record and raw bytes follow. Once a record is
-// read empty, Read of the TLS connection peeks at the first byte of rawInput and
-// parses an alert record if it is 0x15 (all of metacubex/tls, utls and so REALITY
-// do), but here that byte is raw data and may be anything. So the last byte does
-// not go through Read: the first three do, which leaves one in input and no peek,
-// and that one is taken out of input directly.
-func (l *lane) readRawLen(head *[frameHead + 4]byte, n *int) (int64, error) {
-	if !l.canRaw {
-		return 0, protoError("unexpected RAW frame")
+//   - frData / frRaw: the payload is pending; fetch it with readPayload until pending() is false.
+//   - anything else: payload is the complete frame body, valid until the next call.
+//
+// PAD frames are skipped. The call can be repeated after a timeout.
+func (l *lane) next() (typ byte, payload []byte, err error) {
+	for {
+		if err = l.fill(l.head[:], &l.headN); err != nil {
+			return 0, nil, err
+		}
+		typ, n := l.head[0], int(l.head[1])<<8|int(l.head[2])
+		switch typ {
+		case frData:
+			l.headN = 0
+			if n == 0 {
+				continue
+			}
+			l.dataLeft = n
+			return frData, nil, nil
+		case frRaw:
+			size, err := l.readRawLen(n)
+			if err != nil {
+				return 0, nil, err
+			}
+			l.headN = 0
+			if size == 0 {
+				continue
+			}
+			l.rawLeft = size
+			l.event("rawin")
+			return frRaw, nil, nil
+		}
+		if l.body == nil {
+			l.body, l.bodyN = make([]byte, n), 0
+		}
+		if err = l.fill(l.body, &l.bodyN); err != nil {
+			return 0, nil, err
+		}
+		payload, l.body, l.headN = l.body, nil, 0
+		if typ != frPad {
+			return typ, payload, nil
+		}
 	}
-	if err := l.readMore(head[:frameHead+3], n); err != nil {
+}
+
+// readRawLen reads the body of a RAW frame (a u32).
+//
+// RAW is the last frame of its record and raw bytes follow it. A Go TLS connection's Read, once it has
+// emptied a record, peeks at the first byte of rawInput and parses an alert record if it is 0x15 — but
+// here that byte is raw data and can be anything. So the last byte does not go through Read: the first
+// three are read normally (one byte is left in input, so no peek happens) and the last one is taken
+// straight out of input.
+func (l *lane) readRawLen(n int) (int64, error) {
+	if n != 4 || !l.canRaw {
+		return 0, errors.New("miu: unexpected RAW frame")
+	}
+	if l.body == nil {
+		l.body, l.bodyN = make([]byte, 4), 0
+	}
+	if err := l.fill(l.body[:3], &l.bodyN); err != nil {
 		return 0, err
 	}
 	b, err := l.in.ReadByte()
 	if err != nil || l.in.Len() != 0 {
-		return 0, protoError("RAW frame is not the last frame of its record")
+		return 0, errors.New("miu: RAW frame is not the last frame of its record")
 	}
-	head[frameHead+3] = b
-	return int64(binary.BigEndian.Uint32(head[frameHead:])), nil
+	l.body[3] = b
+	size := int64(binary.BigEndian.Uint32(l.body))
+	l.body = nil
+	return size, nil
 }
 
-// readRaw reads from the current raw segment, p must not be longer than what is
-// left of it: first what the TLS connection already took off the socket, then
-// the socket itself. Nothing is read beyond the segment, so nothing has to be
-// handed back to the TLS connection.
-func (l *lane) readRaw(p []byte) (int, error) {
-	if l.rin.Len() > 0 {
-		return l.rin.Read(p)
+// pending reports whether payload of the current DATA frame or raw segment is still unread.
+func (l *lane) pending() bool { return l.dataLeft > 0 || l.rawLeft > 0 }
+
+// readPayload reads some of the pending payload into p. Raw bytes come first from what the TLS
+// connection has already read off the socket, then from the socket itself — never more than the segment
+// holds, so nothing that belongs to the next TLS record is taken.
+func (l *lane) readPayload(p []byte) (n int, err error) {
+	switch {
+	case l.dataLeft > 0:
+		if len(p) > l.dataLeft {
+			p = p[:l.dataLeft]
+		}
+		n, err = l.conn.Read(p)
+		l.dataLeft -= n
+	case l.rawLeft > 0:
+		if int64(len(p)) > l.rawLeft {
+			p = p[:l.rawLeft]
+		}
+		if l.rin.Len() > 0 {
+			n, _ = l.rin.Read(p)
+		} else {
+			n, err = l.sock.Read(p)
+		}
+		l.rawLeft -= int64(n)
 	}
-	return l.raw.Read(p)
+	if n > 0 {
+		err = nil
+	}
+	return n, err
 }
 
-// ---- write ----
+// control handles the frames a client can receive at any point: ServerSettings and UpdatePaddingScheme.
+func (l *lane) control(typ byte, payload []byte) error {
+	switch typ {
+	case frServerSettings:
+		kv := parseKV(string(payload))
+		l.peerRaw.Store(kv["raw"] == "1")
+		if idle, ok := kvInt(kv, "idle"); ok && idle > 0 {
+			l.peerIdle.Store(idle)
+		}
+	case frUpdatePadding:
+		if s := parsePaddingScheme(string(payload)); s != nil {
+			l.scheme.Store(s)
+			if l.client != nil {
+				l.client.updatePadding(s)
+			}
+		}
+	default:
+		return fmt.Errorf("miu: unexpected frame type %d", typ)
+	}
+	return nil
+}
 
+// discardToEnd reads the downlink up to and including END, dropping the payload (client side).
+func (l *lane) discardToEnd() error {
+	buf := getBuf()
+	defer putBuf(buf)
+	for {
+		for l.pending() {
+			if _, err := l.readPayload(*buf); err != nil {
+				return err
+			}
+		}
+		typ, payload, err := l.next()
+		if err != nil {
+			return err
+		}
+		switch typ {
+		case frData, frRaw:
+		case frEnd:
+			return nil
+		default:
+			if err := l.control(typ, payload); err != nil {
+				return err
+			}
+		}
+	}
+}
+
+// ---- writing ----
+
+// write writes p, preceded by the pending prefix if there is one. Caller holds wmu (or owns the lane).
 func (l *lane) write(p []byte) error {
+	if len(l.prefix) > 0 {
+		p = append(l.prefix[:len(l.prefix):len(l.prefix)], p...)
+		l.prefix = nil
+		if !l.server {
+			l.unauthed.Store(false)
+		}
+		if l.prefixTimer != nil {
+			l.prefixTimer.Stop()
+		}
+	}
 	_, err := l.conn.Write(p)
 	return err
 }
 
-// writePacket sends one packet, a run of frames. Within the stop of the padding
-// scheme it is cut into TLS records of the prescribed sizes and filled up with
-// PAD frames, otherwise it goes out in one write. A cut may fall inside a frame,
-// the peer parses frames from the byte stream.
+// deferPrefix queues b to go out at the start of the next write; if nothing is written within wait, it
+// goes alone (padded like any small record).
+func (l *lane) deferPrefix(b []byte, wait time.Duration) {
+	l.wmu.Lock()
+	defer l.wmu.Unlock()
+	l.prefix = append(l.prefix, b...)
+	if l.prefixTimer == nil {
+		l.prefixTimer = time.AfterFunc(wait, l.flushPrefixLocked)
+	} else {
+		l.prefixTimer.Reset(wait)
+	}
+}
+
+func (l *lane) flushPrefixLocked() {
+	l.wmu.Lock()
+	defer l.wmu.Unlock()
+	if err := l.flushPrefix(); err != nil {
+		l.close()
+	}
+}
+
+// flushPrefix writes a pending prefix on its own. Caller holds wmu.
+func (l *lane) flushPrefix() error {
+	if len(l.prefix) == 0 || l.closed.Load() {
+		return nil
+	}
+	return l.write(l.padSmall(nil))
+}
+
+func (l *lane) writeFrame(typ byte, payload []byte) error {
+	l.wmu.Lock()
+	defer l.wmu.Unlock()
+	return l.write(l.padSmall(appendFrame(make([]byte, 0, frameHead+len(payload)), typ, payload)))
+}
+
+// writeUnshaped writes already encoded frames as they are, padded if they make a small record.
+func (l *lane) writeUnshaped(p []byte) error {
+	l.wmu.Lock()
+	defer l.wmu.Unlock()
+	return l.write(l.padSmall(p))
+}
+
+// writeLanePacket sends one "packet" (a few encoded frames) as the lane's next one. Packets are counted
+// per lane, not per stream: the shaping covers the start of the lane only. Shaping every stream the same
+// way would repeat the scheme's lengths at the start of every stream a lane carries, which is easy to see.
+func (l *lane) writeLanePacket(p []byte) error {
+	l.wmu.Lock()
+	defer l.wmu.Unlock()
+	l.sent++
+	return l.writePacketLocked(l.sent, p)
+}
+
+// writePacket sends one "packet" (a few encoded frames). While pkt is below the scheme's stop, the packet
+// is cut into TLS records of the prescribed lengths, the last one filled up with a PAD frame; otherwise it
+// goes out in one write. A cut may fall inside a frame: the peer parses frames from the byte stream.
 func (l *lane) writePacket(pkt uint32, p []byte) error {
+	l.wmu.Lock()
+	defer l.wmu.Unlock()
+	return l.writePacketLocked(pkt, p)
+}
+
+func (l *lane) writePacketLocked(pkt uint32, p []byte) error {
+	scheme := l.scheme.Load()
 	var sizes []int
-	if scheme := l.c.padding.Load(); pkt < scheme.Stop {
-		sizes = scheme.GenerateRecordPayloadSizes(pkt)
+	if scheme != nil && pkt < scheme.stop {
+		sizes = scheme.sizesFor(pkt)
 	}
 	for _, size := range sizes {
-		if size == padding.CheckMark {
+		if size == checkMark {
 			if len(p) == 0 {
 				break
 			}
 			continue
 		}
 		if size <= frameHead || size >= 8192 {
-			break // a broken scheme: the rest goes out unshaped
+			break // broken scheme: the rest goes out unshaped
 		}
 		switch {
 		case len(p) > size:
@@ -202,14 +371,14 @@ func (l *lane) writePacket(pkt uint32, p []byte) error {
 			p = p[size:]
 		case len(p) > 0:
 			if pad := size - len(p) - frameHead; pad > 0 {
-				p = appendPad(p, pad)
+				p = appendFrame(p[:len(p):len(p)], frPad, make([]byte, pad))
 			}
 			if err := l.write(p); err != nil {
 				return err
 			}
 			p = nil
 		default:
-			if err := l.write(appendPad(nil, size)); err != nil {
+			if err := l.write(appendFrame(nil, frPad, make([]byte, size))); err != nil {
 				return err
 			}
 		}
@@ -220,147 +389,117 @@ func (l *lane) writePacket(pkt uint32, p []byte) error {
 	return nil
 }
 
-// writePacketEnd sends a packet and, with end set, the END frame after it. END is
-// never shaped and is the last byte of its direction: a PAD after it would reach
-// the peer when the lane is already back in its pool, where pending data means
-// the lane is being closed.
-func (l *lane) writePacketEnd(pkt uint32, p []byte, end bool) error {
-	if len(p) > 0 {
-		if err := l.writePacket(pkt, p); err != nil {
-			return err
-		}
-	}
-	if !end {
-		return nil
-	}
-	return l.write(appendFrame(nil, frEnd, nil))
+// writeRawHeader writes the record announcing a raw segment: the RAW frame, which has to be the last
+// frame of its record, padded in front like any small record (it would otherwise always be the same few
+// dozen bytes long, before every segment). n raw bytes follow. Caller holds wmu.
+func (l *lane) writeRawHeader(n int) error {
+	return l.writeRawHeaderAfter(nil, n)
 }
 
-// writeRaw sends p as raw segments: a record holding nothing but the RAW frame,
-// then the bytes straight to the connection below the outer TLS. The connection
-// is corked in between where that is possible, so that the few bytes of that
-// record do not travel in a packet of their own.
+// writeRawHeaderAfter writes lead (encoded frames) and the RAW frame for n bytes as one record.
+func (l *lane) writeRawHeaderAfter(lead []byte, n int) error {
+	hdr := append(lead, frRaw, 0, 4, 0, 0, 0, 0)
+	binary.BigEndian.PutUint32(hdr[len(hdr)-4:], uint32(n))
+	return l.write(l.padSmall(hdr))
+}
+
+// firstRecordLen returns the length, header included, of the TLS record at the start of a followed by
+// b; 0 when the header is not all there.
+func firstRecordLen(a, b []byte) int {
+	var h [5]byte
+	k := copy(h[:], a)
+	if copy(h[k:], b) < 5-k {
+		return 0
+	}
+	return 5 + int(binary.BigEndian.Uint16(h[3:]))
+}
+
+// writeRaw sends p as raw segments: a record with the RAW frame, then the bytes straight to the socket.
+// It cuts p every maxSeg bytes regardless of what p holds, so streams use writeRawRecords instead.
 func (l *lane) writeRaw(p []byte) error {
 	for len(p) > 0 {
-		seg := p
-		if len(seg) > maxSeg {
-			seg = seg[:maxSeg]
-		}
-		var head [frameHead + 4]byte
-		head[0], head[2] = frRaw, 4
-		binary.BigEndian.PutUint32(head[frameHead:], uint32(len(seg)))
-		setCork(l.raw, true)
-		err := l.write(head[:])
-		if err == nil {
-			_, err = l.raw.Write(seg)
-		}
-		setCork(l.raw, false)
-		if err != nil {
+		seg := p[:minInt(len(p), maxSeg)]
+		p = p[len(seg):]
+		if err := l.writeRawRecords(seg, nil); err != nil {
 			return err
 		}
-		l.c.observe("raw:out")
-		p = p[len(seg):]
 	}
 	return nil
 }
 
-// ---- inner TLS ----
+// maxPlain is the most plaintext one TLS record carries.
+const maxPlain = 16384
 
-// recScan follows the TLS record boundaries of the inner data in one direction:
-// a ServerHello tells whether the inner connection is TLS 1.3, and once it is, an
-// application_data record header at a boundary means everything behind may go out
-// raw. That is the condition XTLS-Vision switches to direct copy on, but tracked
-// over the byte stream instead of requiring a read to line up with a record.
-type recScan struct {
-	tls13 *atomic.Bool // of the stream, both directions share it
-	hdr   []byte
-	need  int
-	sh    []byte
-	inSH  bool
-	seen  int
-	dead  bool
+// writeRawRecords sends a followed by b as one raw segment. Callers pass whole inner TLS records, at
+// most maxSeg bytes in all.
+//
+// When the first of those records fits, it goes inside the record that announces the segment, as DATA
+// in front of the RAW frame: the announcement is then not a small record of its own ahead of every
+// segment, but a record about as long as an inner one. A full-size inner record does not fit; then the
+// announcement stands alone (padded like any small record).
+func (l *lane) writeRawRecords(a, b []byte) error {
+	l.wmu.Lock()
+	defer l.wmu.Unlock()
+	var lead []byte
+	if first := firstRecordLen(a, b); first > 0 && first < len(a)+len(b) &&
+		len(l.prefix)+frameHead+first+frameHead+4 <= maxPlain {
+		rec := make([]byte, 0, first)
+		k := minInt(first, len(a))
+		rec = append(append(rec, a[:k]...), b[:first-k]...)
+		a, b = a[k:], b[first-k:]
+		lead = appendFrame(make([]byte, 0, frameHead+first+frameHead+4), frData, rec)
+		l.event("rawlead")
+	}
+	// Cork the socket between the RAW frame and its data, so that the announcement does not travel in a
+	// packet of its own.
+	setCork(l.sock, true)
+	err := l.writeRawHeaderAfter(lead, len(a)+len(b))
+	if err == nil {
+		switch {
+		case len(a) == 0:
+			_, err = l.sock.Write(b)
+		case len(b) == 0:
+			_, err = l.sock.Write(a)
+		default:
+			bufs := net.Buffers{a, b} // one writev
+			_, err = bufs.WriteTo(l.sock)
+		}
+	}
+	setCork(l.sock, false)
+	if err == nil {
+		l.event("raw")
+	}
+	return err
 }
 
-// feed takes the next bytes of the direction and reports whether what follows
-// them may go out raw.
-func (s *recScan) feed(b []byte) bool {
-	if s.dead {
-		return false
+// spliceRaw sends the next n bytes of src as one raw segment without bringing them into user space where
+// the platform allows it (on Linux io.CopyN between two TCP connections is a splice). The caller has made
+// sure that n bytes are already waiting in src's receive buffer, so the declared length is always met.
+func (l *lane) spliceRaw(src *net.TCPConn, n int) error {
+	l.wmu.Lock()
+	defer l.wmu.Unlock()
+	setCork(l.sock, true)
+	err := l.writeRawHeader(n)
+	if err == nil {
+		_, err = io.CopyN(l.sock, src, int64(n))
 	}
-	if s.seen += len(b); s.seen > sniffLimit {
-		s.dead = true
-		return false
+	setCork(l.sock, false)
+	if err == nil {
+		l.event("raw")
+		l.event("splice")
 	}
-	for len(b) > 0 {
-		if s.need > 0 {
-			k := s.need
-			if k > len(b) {
-				k = len(b)
-			}
-			if s.inSH {
-				s.sh = append(s.sh, b[:k]...)
-			}
-			s.need -= k
-			b = b[k:]
-			if s.need == 0 && s.inSH {
-				s.inSH = false
-				if isTLS13ServerHello(s.sh) {
-					s.tls13.Store(true)
-				}
-				s.sh = nil
-			}
-			continue
-		}
-		k := 5 - len(s.hdr)
-		if k > len(b) {
-			k = len(b)
-		}
-		s.hdr = append(s.hdr, b[:k]...)
-		b = b[k:]
-		if len(s.hdr) < 5 {
-			break
-		}
-		typ := s.hdr[0]
-		if s.hdr[1] != 3 || typ < 0x14 || typ > 0x17 {
-			s.dead = true // not TLS
-			return false
-		}
-		if typ == 0x17 && s.tls13.Load() {
-			return true
-		}
-		s.need = int(s.hdr[3])<<8 | int(s.hdr[4])
-		s.inSH = typ == 0x16 && !s.tls13.Load()
-		s.hdr = s.hdr[:0]
-	}
-	return false
+	return err
 }
 
-// isTLS13ServerHello reports whether the handshake message is a ServerHello whose
-// supported_versions extension selects 0x0304.
-func isTLS13ServerHello(b []byte) bool {
-	if len(b) < 4+2+32+1 || b[0] != 2 {
-		return false
+func (l *lane) settingsText(extra string) []byte {
+	raw := "0"
+	if l.canRaw {
+		raw = "1"
 	}
-	p := b[4+2+32:]
-	sid := int(p[0])
-	if len(p) < 1+sid+3+2 {
-		return false
-	}
-	p = p[1+sid+3:]
-	n := int(p[0])<<8 | int(p[1])
-	if p = p[2:]; n < len(p) {
-		p = p[:n]
-	}
-	for len(p) >= 4 {
-		typ := int(p[0])<<8 | int(p[1])
-		l := int(p[2])<<8 | int(p[3])
-		if len(p) < 4+l {
-			return false
-		}
-		if typ == 0x002b && l == 2 && p[4] == 3 && p[5] == 4 {
-			return true
-		}
-		p = p[4+l:]
-	}
-	return false
+	return []byte("v=2\nraw=" + raw + extra)
+}
+
+// jitter returns d scaled by a random factor in [low, 1].
+func jitter(d time.Duration, low float64) time.Duration {
+	return time.Duration(float64(d) * (low + (1-low)*mrand.Float64()))
 }

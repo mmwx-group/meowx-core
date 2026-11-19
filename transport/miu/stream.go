@@ -9,749 +9,633 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-
-	"github.com/metacubex/mihomo/common/pool"
 )
 
-const (
-	// A new stream waits this long for the first bytes of the app, they then
-	// leave in one packet with OPEN. Without any, OPEN goes out alone: a protocol
-	// where the server speaks first must not wait for this end.
-	firstPayloadWait = 10 * time.Millisecond
-	// On a lane from the pool a stream keeps what it sent until the server
-	// answers, up to this much. Should the lane turn out to be dead, all of it
-	// is sent again on a new one.
-	replayLimit = 64 << 10
-	// data taken into one packet
-	maxPacket = 4 * maxData
-	// how long an aborted stream waits for the END of the server before it gives
-	// the lane up
-	abortDrain = 3 * time.Second
-	// how long Close gives the connection to take the one frame it writes
-	closeGrace = 100 * time.Millisecond
+// holdWait is how long the start of an inner record may wait for the rest of the record, counted from
+// when it was first held, before it goes out as DATA instead. The inner TLS cannot use a record before it is complete, so holding the tail
+// costs the application nothing as long as the rest follows promptly.
+const holdWait = 20 * time.Millisecond
+
+var (
+	errDownEnd = errors.New("miu: end of downlink")
+	errSwapped = errors.New("miu: lane replaced")
 )
 
-// a read deadline that has a read under way return at once
-var aLongTimeAgo = time.Unix(1, 0)
+// stream is the client side of one stream, as a net.Conn. It owns its lane until both directions have
+// ended, then hands it back to the pool. Closing it earlier aborts the stream: RESET goes out, the
+// downlink is read up to the server's END and dropped, and the lane is pooled all the same.
+type stream struct {
+	c      *Client
+	remote net.Addr
+	// open is what starts the stream: the OPEN frame, for UDP followed by the DATA frame with the UoT
+	// request. It leaves together with the first payload, or alone after firstPayloadWait.
+	open  []byte
+	lane  atomic.Pointer[lane]
+	state streamState
+	timer *time.Timer
 
-// errStale: the lane the downlink was reading from got replaced by the uplink.
-var errStale = errors.New("miu: lane replaced")
-
-// Stream implements net.Conn, it is the one stream a lane carries at a time:
-//
-//	OPEN, then in each direction DATA* (RAW + raw bytes)* END
-//
-// Once both directions are through END the lane goes back to the pool. Close
-// before that aborts the stream: RESET, then the rest of the downlink is read and
-// dropped in the background up to the END of the server, and the lane goes back
-// all the same.
-type Stream struct {
-	c             *Client
-	dest          []byte // payload of OPEN
-	local, remote net.Addr
-
-	// the ServerHello in the downlink says the inner connection is TLS 1.3, the
-	// uplink needs to know
-	tls13 atomic.Bool
-	// a frame of this stream arrived: from here on it cannot move to another lane
-	gotDown atomic.Bool
-	// set under smu. From here on nothing new starts on the lane, and whoever
-	// holds rmu or wmu lets go without delay.
-	closed atomic.Bool
-
-	// smu guards what both directions and Close look at
-	smu      sync.Mutex
-	l        *lane // nil while it is being replaced
-	fail     error // why there is no lane any more
-	upEnd    bool  // END is sent
-	downEnd  bool  // END is received
-	done     bool  // the lane is back in the pool and no longer ours
-	rdl, wdl time.Time
-
-	// uplink
-	wmu    sync.Mutex
-	opened bool // OPEN went out
-	ended  bool // END is among what was pushed
-	pkt    uint32
-	raw    bool // past the inner handshake: raw segments from here on
-	up     recScan
-	keep   bool // sent holds all of the uplink so far
-	sent   []byte
-	werr   error
-	timer  *time.Timer
-
-	// downlink
+	// rmu guards the read side: Read, and the drain that follows Close.
 	rmu       sync.Mutex
-	rl        *lane
-	head      [frameHead + 4]byte // header of the frame being read, and the body of a RAW frame
-	headN     int
-	ctl       []byte // payload of the control frame being read
-	ctlN      int
-	dataLeft  int   // of the current DATA frame
-	rawLeft   int64 // of the current raw segment
-	down      recScan
-	committed bool
-	eof       bool
+	downScan  recScan
+	downEnded bool
 	rerr      error
+
+	// wmu guards the write side: Write, CloseWrite, the deferred OPEN, a replay and the abort.
+	// Lock order: rmu, wmu, mu.
+	wmu     sync.Mutex
+	opened  bool // OPEN has been sent
+	upScan  recScan
+	raw     bool // the uplink is in its raw phase
+	upEnded bool // END has been sent
+	werr    error
+	history []byte // the uplink so far, kept while a replay is still possible
+	frames  []byte // scratch
+
+	// hold is the start of an inner record whose rest has not been written yet: a raw segment only takes
+	// whole records. holdTimer sends it as DATA after holdWait. Guarded by wmu.
+	hold      []byte
+	holdSpare []byte
+	holdTimer *time.Timer
+
+	mu sync.Mutex
+	// replayable: the lane came from the pool, nothing has been received and at most replayLimit sent.
+	// If the lane turns out to be dead the stream starts over on a new one. swapping: that is underway.
+	replayable bool
+	swapping   bool
+	sawDown    bool // a downlink frame of this stream has arrived
+	upDone     bool
+	downDone   bool
+	released   bool // the lane is no longer the stream's
+	rd, wd     time.Time
+	laneUsed   bool // the lane had carried a stream before this one
+
+	seenDown atomic.Bool // sawDown, readable without mu
+	closed   atomic.Bool
 }
 
-func newStream(c *Client, l *lane, dest []byte) *Stream {
-	s := &Stream{
-		c:      c,
-		dest:   dest,
-		local:  l.conn.LocalAddr(),
-		remote: l.conn.RemoteAddr(),
-		l:      l,
-		rl:     l,
-		pkt:    1,
-		keep:   l.pooled,
-	}
-	s.up = recScan{tls13: &s.tls13, dead: !l.canRaw}
-	s.down = recScan{tls13: &s.tls13, dead: !l.canRaw}
-	s.timer = time.AfterFunc(firstPayloadWait, s.openAlone)
-	return s
-}
-
-// isTimeout: a read or write deadline set on the stream ran out. ETIMEDOUT from
-// the kernel (retransmission gave up on a lane that died silently) is a
-// net.Error with Timeout() true as well, but it means the lane is dead: it has
-// to go through the replay like any other failure, not come back as a deadline.
-func isTimeout(err error) bool {
-	return errors.Is(err, os.ErrDeadlineExceeded)
-}
-
-// ---- uplink ----
-
-// Write implements net.Conn
-func (s *Stream) Write(p []byte) (n int, err error) {
-	if s.closed.Load() {
-		return 0, io.ErrClosedPipe
-	}
-	s.wmu.Lock()
-	defer s.wmu.Unlock()
-	for len(p) > 0 {
-		chunk := p
-		limit := maxPacket
-		if s.raw {
-			limit = maxSeg
-		}
-		if len(chunk) > limit {
-			chunk = chunk[:limit]
-		}
-		if err = s.push(chunk, false); err != nil {
-			return n, err
-		}
-		n += len(chunk)
-		p = p[len(chunk):]
-	}
-	return n, nil
-}
-
-// CloseWrite ends the uplink, the downlink goes on.
-func (s *Stream) CloseWrite() error {
-	if s.closed.Load() {
-		return io.ErrClosedPipe
-	}
-	s.wmu.Lock()
-	defer s.wmu.Unlock()
-	if s.ended {
-		return nil
-	}
-	return s.push(nil, true)
-}
-
-// openAlone sends OPEN when the app did not write in time.
-func (s *Stream) openAlone() {
-	s.wmu.Lock()
-	defer s.wmu.Unlock()
-	if !s.opened {
-		_ = s.push(nil, false)
-	}
-}
-
-// push sends the next piece of the uplink: p, then END when end is set. Should
-// the lane fail, the stream moves to a new one if it still can. wmu must be held.
-func (s *Stream) push(p []byte, end bool) error {
-	if s.werr != nil {
-		return s.werr
-	}
-	if s.ended {
-		return io.ErrClosedPipe
-	}
-	s.smu.Lock()
-	l, fail := s.l, s.fail
-	s.smu.Unlock()
-	if s.closed.Load() {
-		return io.ErrClosedPipe
-	}
-	if l == nil {
-		// With wmu held nobody is replacing the lane: the downlink did and got
-		// none (the replay could not dial), fail tells why.
-		if fail == nil {
-			fail = io.ErrClosedPipe
-		}
-		s.werr = fail
-		return fail
-	}
-	if s.keep {
-		if s.gotDown.Load() || len(s.sent)+len(p) > replayLimit {
-			s.keep, s.sent = false, nil
-		} else {
-			s.sent = append(s.sent, p...)
-		}
-	}
-	s.ended = end
-
-	err := s.send(l, p, end)
-	if err != nil && !isTimeout(err) {
-		// replacing sends everything pushed so far, this piece included
-		_, err = s.replace(l, err)
-	}
+func (c *Client) open(ctx context.Context, open []byte, remote net.Addr, udp bool) (*stream, error) {
+	l, pooled, used, err := c.get(ctx)
 	if err != nil {
-		s.werr = err
+		return nil, err
+	}
+	s := &stream{c: c, remote: remote, open: open, replayable: pooled, laneUsed: used}
+	s.lane.Store(l)
+	// UDP streams never use raw segments; neither does a lane that cannot carry them.
+	s.upScan = recScan{st: &s.state, dead: udp || !l.canRaw, follow: true}
+	s.downScan = recScan{st: &s.state, dead: udp || !l.canRaw}
+	s.timer = time.AfterFunc(firstPayloadWait, s.flushOpen)
+	return s, nil
+}
+
+// ---- the write side ----
+
+// Write sends p up the stream. Each call (up to maxBatch bytes of it) is one batch: a "packet" for the
+// shaping while the stream is in its DATA phase, a raw segment once the inner TLS 1.3 handshake is past
+// and the batch is large enough.
+func (s *stream) Write(p []byte) (int, error) {
+	s.wmu.Lock()
+	defer s.wmu.Unlock()
+	total := 0
+	for {
+		switch {
+		case s.closed.Load():
+			return total, net.ErrClosed
+		case s.upEnded:
+			return total, io.ErrClosedPipe
+		case s.werr != nil:
+			return total, s.werr
+		case len(p) == 0:
+			return total, nil
+		}
+		k := minInt(len(p), maxBatch)
+		if s.raw {
+			// Room for a held record tail: a raw segment stays within maxSeg.
+			k = minInt(len(p), maxSeg/2)
+		}
+		if err := s.send(p[:k]); err != nil {
+			s.werr = err
+			return total, err
+		}
+		total += k
+		p = p[k:]
+	}
+}
+
+// send writes one batch. Caller holds wmu.
+func (s *stream) send(b []byte) error {
+	l := s.lane.Load()
+	if s.raw {
+		err := s.sendRaw(l, b)
+		if err != nil {
+			l.close()
+		}
 		return err
 	}
-	if end {
-		s.smu.Lock()
-		s.upEnd = true
-		s.smu.Unlock()
-		s.release()
+	ready := s.upScan.feed(b)
+	if err := s.sendPacket(l, b); err == nil {
+		s.remember(b)
+	} else {
+		if !s.replay(l) {
+			l.close()
+			return err
+		}
+		l = s.lane.Load()
+		if err := s.sendPacket(l, b); err != nil {
+			l.close()
+			return err
+		}
+	}
+	// The record header that makes the direction ready went out as DATA; raw segments start with the
+	// next batch, provided the peer can take them.
+	if ready && l.peerRaw.Load() {
+		s.raw = true
 	}
 	return nil
 }
 
-// send writes one piece of the uplink to l. Data goes out as one packet of DATA
-// frames, with OPEN in front of the first, while the inner TLS 1.3 handshake is
-// looked for along the way. Once that is through it goes as raw segments, save
-// for a small piece, which is a plain write of DATA frames.
-func (s *Stream) send(l *lane, p []byte, end bool) error {
-	if s.raw {
+// sendRaw sends b in the raw phase. Raw segments carry whole inner records only: the start of a record
+// whose rest has not arrived is held back (see holdWait), and a record that has already been partly
+// sent as DATA is finished as DATA. A batch smaller than rawMin goes as DATA. Caller holds wmu.
+func (s *stream) sendRaw(l *lane, b []byte) error {
+	sc := &s.upScan
+	if sc.lost {
+		return s.sendRawData(l, b)
+	}
+	// A record begun in DATA ends in DATA: a raw segment must start on a record boundary.
+	cont := len(s.hold) == 0 && !sc.atBoundary()
+	first, last := sc.walk(b)
+	if sc.lost {
+		// The uplink no longer parses as TLS records: no more raw segments on this stream.
+		h := s.takeHold()
+		if err := s.sendRawData(l, h); err != nil {
+			return err
+		}
+		return s.sendRawData(l, b)
+	}
+	if cont {
+		if first < 0 {
+			return s.sendRawData(l, b)
+		}
+		if err := s.sendRawData(l, b[:first]); err != nil {
+			return err
+		}
+		b, last = b[first:], last-first
+	}
+	// The whole records are hold + b[:last]; the rest of b starts the next record.
+	if last > 0 {
+		whole := b[:last]
+		b = b[last:]
+		h := s.takeHold()
 		var err error
-		if len(p) >= rawMin {
-			err = l.writeRaw(p)
-		} else if len(p) > 0 {
-			err = l.write(appendData(make([]byte, 0, frameHead+len(p)), p))
+		if n := len(h) + len(whole); n >= rawMin {
+			err = l.writeRawRecords(h, whole)
+		} else {
+			s.frames = appendData(appendData(s.frames[:0], h), whole)
+			err = l.writeUnshaped(s.frames)
 		}
 		if err != nil {
 			return err
 		}
-		if !end {
-			return nil
+	}
+	if len(b) > 0 {
+		// The wait counts from when the start of the record was first held: more pieces of the same
+		// record do not extend it.
+		if len(s.hold) == 0 {
+			if s.holdTimer == nil {
+				s.holdTimer = time.AfterFunc(holdWait, s.flushHold)
+			} else {
+				s.holdTimer.Reset(holdWait)
+			}
 		}
-		p = nil
+		s.hold = append(s.hold, b...)
 	}
-	buf := pool.Get(len(s.dest) + len(p) + frameHead*(len(p)/maxData+3))
-	b := buf[:0]
+	return nil
+}
+
+// sendRawData sends b as DATA frames, unshaped, in the raw phase. Caller holds wmu.
+func (s *stream) sendRawData(l *lane, b []byte) error {
+	if len(b) == 0 {
+		return nil
+	}
+	s.frames = appendData(s.frames[:0], b)
+	return l.writeUnshaped(s.frames)
+}
+
+// takeHold empties the hold and returns what it had. The two hold buffers take turns, so the result
+// stays valid until the next takeHold. Caller holds wmu.
+func (s *stream) takeHold() []byte {
+	h := s.hold
+	s.hold, s.holdSpare = s.holdSpare[:0], h
+	if s.holdTimer != nil {
+		s.holdTimer.Stop()
+	}
+	return h
+}
+
+// flushHold sends a held record tail as DATA once holdWait has passed without the rest of the record;
+// the rest then follows as DATA too.
+func (s *stream) flushHold() {
+	s.wmu.Lock()
+	defer s.wmu.Unlock()
+	if len(s.hold) == 0 || s.upEnded || s.werr != nil || s.closed.Load() {
+		return
+	}
+	l := s.lane.Load()
+	l.event("holdflush")
+	if err := s.sendRawData(l, s.takeHold()); err != nil {
+		l.close()
+		s.werr = err
+	}
+}
+
+// sendPacket sends b as the next shaped packet, preceded by OPEN if that is still to go.
+func (s *stream) sendPacket(l *lane, b []byte) error {
+	s.frames = s.frames[:0]
 	if !s.opened {
-		b = appendFrame(b, frOpen, s.dest)
+		s.frames = append(s.frames, s.open...)
 	}
-	b = appendData(b, p)
-	sw := s.up.feed(p)
-	err := l.writePacketEnd(s.pkt, b, end)
-	_ = pool.Put(buf)
-	if err != nil {
+	s.frames = appendData(s.frames, b)
+	if err := l.writeLanePacket(s.frames); err != nil {
 		return err
 	}
 	s.opened = true
-	s.pkt++
-	if !s.raw {
-		s.raw = sw && l.peerRaw.Load()
-	}
 	return nil
 }
 
-// replace gets a failed lane out of the way and returns the one to go on with.
-// Unless the other direction replaced it already, there is one only if the lane
-// came from the pool (it may have died there unnoticed), the server has not
-// answered anything on this stream yet and all of the uplink is still at hand:
-// then that is sent again on a newly dialed lane. wmu must be held.
-func (s *Stream) replace(old *lane, cause error) (*lane, error) {
-	s.smu.Lock()
-	if s.l != old {
-		l, err := s.l, s.fail
-		s.smu.Unlock()
-		if l == nil && err == nil {
-			err = io.ErrClosedPipe
-		}
-		return l, err
+// remember keeps b for a possible replay. Caller holds wmu.
+func (s *stream) remember(b []byte) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.replayable {
+		return
 	}
-	_, proto := cause.(protoError)
-	if !s.keep || s.gotDown.Load() || s.closed.Load() || proto {
-		if s.closed.Load() {
-			cause = io.ErrClosedPipe
-		} else if cause == io.EOF {
-			cause = io.ErrUnexpectedEOF
-		}
-		s.fail = cause
-		s.smu.Unlock()
-		old.close()
-		return nil, cause
+	if s.sawDown || len(s.history)+len(b) > replayLimit {
+		s.replayable, s.history = false, nil
+		return
 	}
-	s.l = nil // nothing arriving on old counts any more
-	s.smu.Unlock()
+	s.history = append(s.history, b...)
+}
+
+// flushOpen sends OPEN on its own when the application has not written anything within
+// firstPayloadWait: a protocol in which the server speaks first must not wait for the client.
+func (s *stream) flushOpen() {
+	s.wmu.Lock()
+	defer s.wmu.Unlock()
+	if s.opened || s.upEnded || s.werr != nil || s.closed.Load() {
+		return
+	}
+	l := s.lane.Load()
+	if err := s.sendPacket(l, nil); err != nil && !s.replay(l) {
+		l.close()
+		s.werr = err
+	}
+}
+
+// CloseWrite ends the uplink (a half-close). The downlink keeps going.
+func (s *stream) CloseWrite() error {
+	s.wmu.Lock()
+	defer s.wmu.Unlock()
+	switch {
+	case s.closed.Load():
+		return net.ErrClosed
+	case s.upEnded:
+		return nil
+	case s.werr != nil:
+		return s.werr
+	}
+	s.timer.Stop()
+	if len(s.hold) > 0 {
+		if err := s.sendRawData(s.lane.Load(), s.takeHold()); err != nil {
+			s.lane.Load().close()
+			s.werr = err
+			return err
+		}
+	}
+	s.upEnded = true
+	// Like shutdown(2), the half-close is not subject to the write deadline. (crypto/tls, when it is
+	// the inner connection, leaves an expired one behind after sending its close_notify.)
+	s.mu.Lock()
+	s.wd = time.Time{}
+	l := s.lane.Load()
+	_ = l.conn.SetWriteDeadline(time.Time{})
+	s.mu.Unlock()
+	if err := s.sendEnd(l, frEnd); err != nil && !s.replay(l) {
+		l.close()
+		s.werr = err
+		return err
+	}
+	s.finish(true, false)
+	return nil
+}
+
+// sendEnd ends the uplink with END or RESET, preceded by OPEN if that is still to go. Nothing here is
+// shaped: END has to be the last byte of the direction. A PAD after it would reach the server while it
+// already considers the stream over. Caller holds wmu.
+func (s *stream) sendEnd(l *lane, typ byte) error {
+	var b []byte
+	if !s.opened {
+		b = append(b, s.open...)
+	}
+	if err := l.writeUnshaped(appendFrame(b, typ, nil)); err != nil {
+		return err
+	}
+	s.opened = true
+	return nil
+}
+
+// replay starts the stream over on a freshly dialed lane after old has failed: OPEN, everything sent so
+// far, and END if the uplink had already ended. It is done at most once, and only while the lane came
+// from the pool and nothing of the downlink has been seen — the case of a pooled lane that died without
+// the client noticing. The other idle lanes went through the same network, so they are dropped too.
+// It reports whether the stream now has a working lane. Caller holds wmu.
+func (s *stream) replay(old *lane) bool {
+	s.mu.Lock()
+	if s.lane.Load() != old {
+		s.mu.Unlock()
+		return true // the other side of the stream has already done it
+	}
+	if !s.replayable || s.sawDown || s.closed.Load() {
+		s.mu.Unlock()
+		return false
+	}
+	s.replayable, s.swapping = false, true
+	s.mu.Unlock()
+
 	old.close()
-
-	l, err := s.replay()
-	s.smu.Lock()
-	defer s.smu.Unlock()
-	if err == nil && s.closed.Load() {
-		l.close()
-		err = io.ErrClosedPipe
+	s.c.CloseIdle()
+	ctx, cancel := context.WithTimeout(context.Background(), defaultDialTimeout)
+	nl, err := s.c.dial(ctx)
+	cancel()
+	if err == nil {
+		// The new lane is fresh: the packet numbering starts over.
+		err = nl.writeLanePacket(appendData(append([]byte(nil), s.open...), s.history))
+		if err == nil && s.upEnded {
+			err = nl.writeFrame(frEnd, nil)
+		}
+		if err != nil {
+			nl.close()
+		}
 	}
+	s.history = nil
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.swapping = false
 	if err != nil {
-		s.fail = err
-		return nil, err
+		return false
 	}
-	s.l = l
-	if !s.rdl.IsZero() {
-		_ = l.conn.SetReadDeadline(s.rdl)
-	}
-	if !s.wdl.IsZero() {
-		_ = l.conn.SetWriteDeadline(s.wdl)
-	}
-	s.keep, s.sent = false, nil
-	s.opened, s.pkt = true, 2
-	return l, nil
-}
-
-// replay dials a new lane and sends the uplink so far on it.
-func (s *Stream) replay() (*lane, error) {
-	// The lane put back last died silently (no FIN: the network changed, a NAT
-	// mapping went away); the ones put back earlier can only be worse.
-	s.c.closeIdle()
-	ctx, cancel := context.WithTimeout(s.c.ctx, dialTimeout)
-	defer cancel()
-	l, err := s.c.dial(ctx)
-	if err != nil {
-		return nil, err
-	}
-	b := appendFrame(make([]byte, 0, len(s.dest)+len(s.sent)+frameHead*(len(s.sent)/maxData+3)), frOpen, s.dest)
-	b = appendData(b, s.sent)
-	if err = l.writePacketEnd(1, b, s.ended); err != nil {
-		l.close()
-		return nil, err
-	}
-	s.c.observe("replay")
-	return l, nil
-}
-
-// ---- downlink ----
-
-// Read implements net.Conn
-func (s *Stream) Read(p []byte) (int, error) {
 	if s.closed.Load() {
-		return 0, io.ErrClosedPipe
+		_ = nl.conn.SetDeadline(time.Now().Add(abortDrain))
+	} else {
+		if !s.rd.IsZero() {
+			_ = nl.conn.SetReadDeadline(s.rd)
+		}
+		if !s.wd.IsZero() {
+			_ = nl.conn.SetWriteDeadline(s.wd)
+		}
 	}
+	s.lane.Store(nl)
+	s.opened = true
+	nl.event("replay")
+	return true
+}
+
+// ---- the read side ----
+
+func (s *stream) Read(p []byte) (int, error) {
 	s.rmu.Lock()
 	defer s.rmu.Unlock()
+	if len(p) == 0 {
+		return 0, nil
+	}
 	for {
-		if s.closed.Load() {
-			// Close came in while this read was under way, even when the stream
-			// ran to its end meanwhile: whoever settles the stream goes on from here
-			return 0, io.ErrClosedPipe
-		}
-		if s.eof {
+		l := s.lane.Load()
+		switch {
+		case s.closed.Load():
+			return 0, net.ErrClosed
+		case s.downEnded:
 			return 0, io.EOF
-		}
-		if s.rerr != nil {
+		case s.rerr != nil:
 			return 0, s.rerr
 		}
-		if len(p) == 0 {
-			return 0, nil
+		n, err := s.readOn(l, p)
+		if n > 0 {
+			return n, nil
 		}
-		n, err := s.readLane(s.rl, p)
-		if s.closed.Load() {
-			// Close had this read return, or came in just as it got something:
-			// either way it is for nobody now
-			return 0, io.ErrClosedPipe
+		switch {
+		case err == errDownEnd:
+			s.downEnded = true
+			s.finish(false, true)
+			return 0, io.EOF
+		case errors.Is(err, os.ErrDeadlineExceeded) && !l.closed.Load():
+			// A deadline set by the application, or the wake-up from Close. The read cursor is intact.
+			if s.closed.Load() {
+				return 0, net.ErrClosed
+			}
+			return 0, err
 		}
-		if err == nil {
-			if n > 0 {
-				return n, nil
+		// The lane failed. A dead pooled lane is replaced once; make sure a writer blocked on it lets go.
+		l.close()
+		if !s.seenDown.Load() {
+			s.wmu.Lock()
+			ok := s.replay(l)
+			s.wmu.Unlock()
+			if ok {
+				continue
+			}
+		}
+		if err == errSwapped || err == io.EOF {
+			err = io.ErrUnexpectedEOF // the lane ended, not the stream
+		}
+		s.rerr = err
+		return 0, err
+	}
+}
+
+// readOn reads downlink payload from l into p. It returns errDownEnd at the server's END.
+func (s *stream) readOn(l *lane, p []byte) (int, error) {
+	for {
+		if l.pending() {
+			data := l.dataLeft > 0
+			n, err := l.readPayload(p)
+			if n > 0 && data {
+				// The inner ServerHello is in the downlink's DATA: the uplink learns from it whether
+				// the inner connection is TLS 1.3.
+				s.downScan.feed(p[:n])
+			}
+			if n > 0 || err != nil {
+				return n, err
 			}
 			continue
 		}
-		if isTimeout(err) {
-			return 0, err // what is read so far of a frame stays, the next Read goes on
-		}
-		l, err := s.relane(s.rl, err)
+		typ, payload, err := l.next()
 		if err != nil {
-			s.rerr = err
 			return 0, err
 		}
-		s.follow(l)
-	}
-}
-
-// follow moves the downlink over to l, a lane nothing was read from yet.
-func (s *Stream) follow(l *lane) {
-	s.rl, s.headN, s.ctl, s.dataLeft, s.rawLeft = l, 0, nil, 0, 0
-	s.down = recScan{tls13: &s.tls13, dead: !l.canRaw}
-}
-
-// readLane reads from l until there is data for p or the downlink ended.
-func (s *Stream) readLane(l *lane, p []byte) (int, error) {
-	for !s.eof {
-		switch {
-		case s.dataLeft > 0:
-			total := 0
-			for {
-				q := p[total:]
-				if len(q) > s.dataLeft {
-					q = q[:s.dataLeft]
-				}
-				n, err := l.conn.Read(q)
-				if n > 0 {
-					s.dataLeft -= n
-					s.down.feed(q[:n])
-					total += n
-				}
-				if err != nil || n == 0 {
-					if total > 0 {
-						return total, nil
-					}
-					if err != nil {
-						return 0, err
-					}
-					break
-				}
-				// A frame is through and p has room: when the next frame is DATA and
-				// its header is already decrypted, go on in this Read instead of
-				// handing back at most one frame per call.
-				if s.dataLeft > 0 || total == len(p) || !s.nextBufferedData(l) {
-					return total, nil
-				}
+		switch typ {
+		case frData, frRaw:
+			if !s.noteDown(l) {
+				return 0, errSwapped
 			}
-		case s.rawLeft > 0:
-			if int64(len(p)) > s.rawLeft {
-				p = p[:s.rawLeft]
+		case frEnd:
+			if len(payload) != 0 {
+				return 0, errors.New("miu: bad END frame")
 			}
-			n, err := l.readRaw(p)
-			if n > 0 {
-				s.rawLeft -= int64(n)
-				return n, nil
+			if !s.noteDown(l) {
+				return 0, errSwapped
 			}
-			if err != nil {
-				return 0, err
-			}
+			return 0, errDownEnd
 		default:
-			if err := s.readFrame(l); err != nil {
+			if err := l.control(typ, payload); err != nil {
 				return 0, err
 			}
 		}
 	}
-	return 0, nil
 }
 
-// nextBufferedData starts the next frame when it is DATA and its header sits in
-// the decrypted input of the outer TLS connection; anything else is left for
-// readFrame.
-func (s *Stream) nextBufferedData(l *lane) bool {
-	if l.in == nil || s.headN != 0 || l.in.Len() < frameHead {
+// noteDown records that the downlink has begun, which rules a replay out. It reports false when a
+// replay got there first: l is then no longer the stream's lane.
+func (s *stream) noteDown(l *lane) bool {
+	if s.seenDown.Load() {
+		return true
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.swapping || s.lane.Load() != l {
 		return false
 	}
-	var h [frameHead]byte
-	if _, err := l.in.ReadAt(h[:], l.in.Size()-int64(l.in.Len())); err != nil || h[0] != frData {
-		return false
-	}
-	if _, err := l.in.Seek(frameHead, io.SeekCurrent); err != nil {
-		return false
-	}
-	s.dataLeft = int(h[1])<<8 | int(h[2])
+	s.sawDown = true
+	s.seenDown.Store(true)
 	return true
 }
 
-// readFrame reads the next frame up to where its data starts: the payload of
-// DATA and the bytes behind RAW are left on the lane. It can be resumed after a
-// timeout.
-func (s *Stream) readFrame(l *lane) error {
-	if err := l.readMore(s.head[:frameHead], &s.headN); err != nil {
-		return err
-	}
-	typ, n := s.head[0], int(s.head[1])<<8|int(s.head[2])
-	switch typ {
-	case frData:
-		if !s.commit(l) {
-			return errStale
-		}
-		s.dataLeft = n
-	case frRaw:
-		if n != 4 {
-			return protoError("bad RAW frame")
-		}
-		size, err := l.readRawLen(&s.head, &s.headN)
-		if err != nil {
-			return err
-		}
-		if !s.commit(l) {
-			return errStale
-		}
-		s.rawLeft = size
-		s.c.observe("raw:in")
-	case frEnd:
-		if n != 0 {
-			return protoError("bad END frame")
-		}
-		if !s.commit(l) {
-			return errStale
-		}
-		s.eof = true
-		s.smu.Lock()
-		s.downEnd = true
-		s.smu.Unlock()
-		s.release()
-	default:
-		if s.ctl == nil {
-			s.ctl, s.ctlN = make([]byte, n), 0
-		}
-		if err := l.readMore(s.ctl, &s.ctlN); err != nil {
-			return err
-		}
-		payload := s.ctl
-		s.ctl = nil
-		if err := l.control(typ, payload); err != nil {
-			return err
-		}
-	}
-	s.headN = 0
-	return nil
-}
+// ---- the end of a stream ----
 
-// commit takes the first frame of this stream arriving on l: the server answered,
-// the stream stays on this lane. It fails when the uplink moved on already, the
-// frame then is void.
-func (s *Stream) commit(l *lane) bool {
-	if !s.committed {
-		s.smu.Lock()
-		if s.committed = s.l == l; s.committed {
-			s.gotDown.Store(true)
-		}
-		s.smu.Unlock()
-	}
-	return s.committed
-}
-
-// relane is replace for the downlink.
-func (s *Stream) relane(old *lane, cause error) (*lane, error) {
-	s.smu.Lock()
-	l := s.l
-	s.smu.Unlock()
-	if l != nil && l != old {
-		return l, nil
-	}
-	// whoever holds wmu now is writing to old or is replacing it: closing old
-	// gets the former out of the way
-	old.close()
-	s.wmu.Lock()
-	defer s.wmu.Unlock()
-	return s.replace(old, cause)
-}
-
-// ---- both ----
-
-// release hands the lane back once both directions are through END.
-func (s *Stream) release() {
-	s.smu.Lock()
-	if !s.upEnd || !s.downEnd || s.done {
-		s.smu.Unlock()
+// finish records the end of a direction. Once both have ended the lane goes back to the pool.
+func (s *stream) finish(up, down bool) {
+	s.mu.Lock()
+	s.upDone = s.upDone || up
+	s.downDone = s.downDone || down
+	if s.released || !s.upDone || !s.downDone {
+		s.mu.Unlock()
 		return
 	}
-	s.done = true
-	l := s.l
-	_ = l.conn.SetDeadline(time.Time{})
-	s.smu.Unlock()
-	l.used = true
-	s.c.put(l)
+	s.released = true
+	l := s.lane.Load()
+	s.mu.Unlock()
+	if l.closed.Load() || l.conn.SetDeadline(time.Time{}) != nil {
+		l.close()
+		return
+	}
+	s.c.put(l, true)
 }
 
-// Close implements net.Conn. It does not wait for the server: a stream that did
-// not run to its end is aborted the way that keeps the lane (see settle), and
-// calls still under way on the stream return right away.
-func (s *Stream) Close() error {
-	s.smu.Lock()
-	if s.closed.Load() {
-		s.smu.Unlock()
+// Close ends the stream. If a direction is still open this is an abort: the server is sent RESET and the
+// rest of the downlink is discarded in the background, after which the lane returns to the pool. Aborts
+// are common (an application closing a connection, a speed test that has read enough), and giving up a
+// lane for each of them would leave the pool without warm connections.
+func (s *stream) Close() error {
+	if !s.closed.CompareAndSwap(false, true) {
 		return nil
 	}
-	s.closed.Store(true)
-	l, done := s.l, s.done
-	if l != nil && !done {
-		// A read under way on the lane returns, its place in the frame is kept.
-		_ = l.conn.SetReadDeadline(aLongTimeAgo)
-	}
-	s.smu.Unlock()
 	s.timer.Stop()
-	if done || l == nil {
-		return nil // l == nil: it is being replaced, replace closes what it dials
-	}
-	if !s.wmu.TryLock() {
-		// A write is under way. It cannot be cut short without leaving the lane
-		// out of step, but mostly it is through already and about to let go (the
-		// timer that sends OPEN alone, a Write the scheduler has not got back to
-		// on a busy machine): wait for it in the background, and give the lane up
-		// only when it is still stuck after closeGrace.
-		go func() {
-			if !lockWithin(&s.wmu, closeGrace) {
-				l.close()
-				return
-			}
-			s.smu.Lock()
-			done := s.done
-			s.smu.Unlock()
-			if done {
-				// that write ran the stream to its end: the lane is back already
-				s.wmu.Unlock()
-				return
-			}
-			s.abort(l)
-		}()
+	s.mu.Lock()
+	if s.released {
+		s.mu.Unlock()
 		return nil
 	}
-	s.abort(l)
+	// Wake a blocked Read now; give a blocked Write until the end of the drain.
+	l := s.lane.Load()
+	_ = l.conn.SetReadDeadline(time.Now())
+	_ = l.conn.SetWriteDeadline(time.Now().Add(abortDrain))
+	s.mu.Unlock()
+	go s.abort()
 	return nil
 }
 
-// abort ends the uplink of a closed stream and takes the lane to where it can
-// carry another one, or closes it. wmu must be held, it is let go here.
-func (s *Stream) abort(l *lane) {
-	last, err := s.endUplink(l)
+func (s *stream) abort() {
+	s.rmu.Lock()
+	defer s.rmu.Unlock()
+	s.wmu.Lock()
+	s.mu.Lock()
+	if s.released {
+		s.mu.Unlock()
+		s.wmu.Unlock()
+		return
+	}
+	s.released = true
+	s.mu.Unlock()
+
+	l := s.lane.Load()
+	deadline := time.Now().Add(abortDrain)
+	clean := s.rerr == nil && s.werr == nil && !l.closed.Load()
+	opened, reset := s.opened, false
+	// A stream whose OPEN never left has nothing to take back. Otherwise: RESET while the downlink is
+	// still running — in place of END, or after it when the application half-closed first and then
+	// closed, the usual order — and a plain END when only the uplink was left open.
+	if clean && opened && !(s.upEnded && s.downEnded) {
+		_ = l.conn.SetWriteDeadline(deadline)
+		typ := byte(frEnd)
+		if !s.downEnded {
+			typ, reset = frReset, true
+		}
+		clean = l.writeFrame(typ, nil) == nil
+	}
 	s.wmu.Unlock()
-	switch {
-	case err != nil:
-		l.close()
-	case last == frEnd:
-		s.release()
-	case last == 0 && s.rmu.TryLock():
-		s.settle(l, false)
-		s.rmu.Unlock()
-	default:
-		go func() {
-			s.rmu.Lock()
-			s.settle(l, last == frReset)
-			s.rmu.Unlock()
-		}()
+	if clean && opened && !s.downEnded {
+		_ = l.conn.SetReadDeadline(deadline)
+		clean = l.discardToEnd() == nil
 	}
-}
-
-// lockWithin locks mu if that can be done within d.
-func lockWithin(mu *sync.Mutex, d time.Duration) bool {
-	deadline := time.Now().Add(d)
-	for !mu.TryLock() {
-		if time.Now().After(deadline) {
-			return false
-		}
-		time.Sleep(time.Millisecond)
-	}
-	return true
-}
-
-// endUplink ends the uplink of a closed stream and tells with what: nothing when
-// OPEN did not go out, END when the downlink is through END already, or else
-// RESET, in place of END or behind it, for the server to stop the downlink. The
-// frame is all that is written, a connection that does not take it within
-// closeGrace is not worth keeping. wmu must be held.
-func (s *Stream) endUplink(l *lane) (last byte, err error) {
-	s.smu.Lock()
-	cur, downEnd := s.l, s.downEnd
-	s.smu.Unlock()
-	if cur != l || s.werr != nil {
-		return 0, io.ErrClosedPipe
-	}
-	if !s.opened {
-		return 0, nil
-	}
-	last = frReset
-	if downEnd {
-		last = frEnd
-	}
-	s.ended = true
-	_ = l.conn.SetWriteDeadline(time.Now().Add(closeGrace))
-	if err = l.write(appendFrame(nil, last, nil)); err != nil {
-		return 0, err
-	}
-	s.smu.Lock()
-	s.upEnd = true
-	s.smu.Unlock()
-	if last == frReset {
-		s.c.observe("reset")
-	}
-	return last, nil
-}
-
-// settle takes the lane of a closed stream to where it can carry another one,
-// or closes it. Without reset nothing of the stream went out: the lane is as it
-// came, unless a frame is half read. With reset the server was told to stop: the
-// downlink is read and dropped up to its END, within the time the client allows.
-// rmu must be held, nobody else reads from the lane meanwhile.
-func (s *Stream) settle(l *lane, reset bool) {
-	s.smu.Lock()
-	done := s.done
-	s.smu.Unlock()
-	if done || l.closed.Load() {
-		return
-	}
-	if s.rerr != nil {
+	if !clean || l.conn.SetDeadline(time.Time{}) != nil {
 		l.close()
 		return
 	}
-	if !reset {
-		if s.headN != 0 || s.ctl != nil || l.conn.SetDeadline(time.Time{}) != nil {
-			l.close()
-			return
-		}
-		s.smu.Lock()
-		s.done = true
-		s.smu.Unlock()
-		s.c.put(l)
-		return
+	if reset {
+		l.event("reset")
 	}
-	if s.rl != l {
-		s.follow(l) // the uplink moved to it and nobody read since
-	}
-	_ = l.conn.SetReadDeadline(time.Now().Add(s.c.drain))
-	buf := pool.Get(16 << 10)
-	defer pool.Put(buf)
-	for !s.eof {
-		if _, err := s.readLane(l, buf); err != nil {
-			l.close()
-			return
-		}
-	}
-	// both directions are through END
-	s.release()
+	s.c.put(l, opened || s.laneUsed)
 }
 
-func (s *Stream) SetReadDeadline(t time.Time) error {
-	s.smu.Lock()
-	defer s.smu.Unlock()
-	s.rdl = t
-	if s.l != nil && !s.done && !s.closed.Load() {
-		return s.l.conn.SetReadDeadline(t)
+// ---- the rest of net.Conn ----
+
+func (s *stream) LocalAddr() net.Addr  { return s.lane.Load().conn.LocalAddr() }
+func (s *stream) RemoteAddr() net.Addr { return s.remote }
+
+func (s *stream) SetDeadline(t time.Time) error {
+	return s.setDeadline(&t, &t)
+}
+
+func (s *stream) SetReadDeadline(t time.Time) error {
+	return s.setDeadline(&t, nil)
+}
+
+func (s *stream) SetWriteDeadline(t time.Time) error {
+	return s.setDeadline(nil, &t)
+}
+
+// setDeadline applies the deadlines to the lane while the stream still owns it. A read that times out
+// can be retried; a write that times out breaks the stream (the TLS record may be half written).
+func (s *stream) setDeadline(rd, wd *time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed.Load() {
+		return net.ErrClosed
+	}
+	if rd != nil {
+		s.rd = *rd
+	}
+	if wd != nil {
+		s.wd = *wd
+	}
+	if s.released {
+		return nil
+	}
+	conn := s.lane.Load().conn
+	if rd != nil {
+		_ = conn.SetReadDeadline(*rd)
+	}
+	if wd != nil {
+		_ = conn.SetWriteDeadline(*wd)
 	}
 	return nil
-}
-
-func (s *Stream) SetWriteDeadline(t time.Time) error {
-	s.smu.Lock()
-	defer s.smu.Unlock()
-	s.wdl = t
-	if s.l != nil && !s.done && !s.closed.Load() {
-		return s.l.conn.SetWriteDeadline(t)
-	}
-	return nil
-}
-
-func (s *Stream) SetDeadline(t time.Time) error {
-	_ = s.SetWriteDeadline(t)
-	return s.SetReadDeadline(t)
-}
-
-// LocalAddr satisfies net.Conn interface
-func (s *Stream) LocalAddr() net.Addr {
-	return s.local
-}
-
-// RemoteAddr satisfies net.Conn interface
-func (s *Stream) RemoteAddr() net.Addr {
-	return s.remote
 }

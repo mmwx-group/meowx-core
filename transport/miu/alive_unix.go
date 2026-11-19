@@ -1,4 +1,4 @@
-//go:build unix
+//go:build linux || darwin || freebsd || netbsd || openbsd || dragonfly
 
 package miu
 
@@ -7,9 +7,8 @@ import (
 	"syscall"
 )
 
-// connAlive looks at an idle connection without taking any data off it: alive is
-// false once the peer closed it (EOF or an error), pending tells that data is
-// waiting to be read. A connection that cannot be looked at counts as alive.
+// connAlive looks at an idle connection without taking any data off it. alive is false when the peer
+// has closed (a read would return EOF or an error); pending tells whether data is waiting to be read.
 func connAlive(c net.Conn) (alive, pending bool) {
 	sc, ok := c.(syscall.Conn)
 	if !ok {
@@ -17,10 +16,10 @@ func connAlive(c net.Conn) (alive, pending bool) {
 	}
 	rc, err := sc.SyscallConn()
 	if err != nil {
-		return true, false
+		return false, false
 	}
 	alive = true
-	_ = rc.Read(func(fd uintptr) bool {
+	err = rc.Read(func(fd uintptr) bool {
 		var b [1]byte
 		n, _, e := syscall.Recvfrom(int(fd), b[:], syscall.MSG_PEEK|syscall.MSG_DONTWAIT)
 		switch {
@@ -32,5 +31,5 @@ func connAlive(c net.Conn) (alive, pending bool) {
 		}
 		return true
 	})
-	return
+	return alive && err == nil, pending
 }

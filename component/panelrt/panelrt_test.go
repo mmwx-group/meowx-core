@@ -515,3 +515,96 @@ func TestResumeDelay(t *testing.T) {
 		t.Fatalf("kick too soon after the last attempt: %v", d)
 	}
 }
+
+func countUplink(list []map[string]any, typ string, chainID, rev float64) int {
+	n := 0
+	for _, m := range list {
+		if m["type"] == typ && m["chainId"] == chainID && m["rev"] == rev {
+			n++
+		}
+	}
+	return n
+}
+
+func entryView(server string) (entryoverride.View, bool) {
+	for _, v := range Entries() {
+		if v.Server == server {
+			return v, true
+		}
+	}
+	return entryoverride.View{}, false
+}
+
+// 入口服务器名称（规格 §2.2）：两种消息都认 names；同一个 rev 的快照带了名称也补上（不回执）；
+// names 形状不对只丢这个字段，消息照常生效；GET /meowx/entries 的条目带出 names。
+func TestRealtimeEntryNames(t *testing.T) {
+	setup(t, "a.test", "b.test", "c.test")
+	p := newFakePanel(t)
+	p.tokens["good"] = true
+	step := make(chan struct{})
+	p.onConnect = func(c *fakeWS) {
+		// 主控升级前（或普通用户的连接）：没有 names
+		_ = c.send(map[string]any{"type": "entry_snapshot", "ready": true, "entries": []any{
+			map[string]any{"server": "a.test", "chainId": 1, "ips": []string{"192.0.2.1", "192.0.2.2"}, "rev": 100}}})
+		<-step
+		// 主控升级后连上：同一个 rev，带了 names
+		_ = c.send(map[string]any{"type": "entry_snapshot", "ready": true, "entries": []any{
+			map[string]any{"server": "a.test", "chainId": 1, "ips": []string{"192.0.2.1", "192.0.2.2"}, "rev": 100,
+				"names": map[string]any{"192.0.2.1": "香港入口 A", "192.0.2.2": 5}}}})
+		_ = c.send(map[string]any{"type": "entry_failover", "domain": "b.test", "healthyIPs": []string{"192.0.2.3"},
+			"chainId": 2, "rev": 200, "names": map[string]string{"192.0.2.3": "东京入口"}})
+		// 形状不对的 names：整条照常生效
+		_ = c.send(map[string]any{"type": "entry_failover", "domain": "c.test", "healthyIPs": []string{"192.0.2.4"},
+			"chainId": 3, "rev": 300, "names": []string{"192.0.2.4"}})
+	}
+	if err := Configure([]Channel{{Base: p.base, Token: "good"}}, nil); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 3*time.Second, "a.test", func() bool { return entryoverride.Lookup("a.test", 0, 0) != nil })
+	if v, _ := entryView("a.test"); v.Names != nil {
+		t.Fatalf("names before upgrade = %v", v.Names)
+	}
+	close(step)
+	waitFor(t, 3*time.Second, "c.test", func() bool { return entryoverride.Lookup("c.test", 0, 0) != nil })
+	waitFor(t, 3*time.Second, "a.test names", func() bool {
+		v, _ := entryView("a.test")
+		return v.Names["192.0.2.1"] == "香港入口 A"
+	})
+	if v, _ := entryView("a.test"); len(v.Names) != 1 {
+		t.Fatalf("non-string name must be skipped: %v", v.Names)
+	}
+	if v, _ := entryView("b.test"); v.Names["192.0.2.3"] != "东京入口" {
+		t.Fatalf("failover names = %v", v.Names)
+	}
+	if v, _ := entryView("c.test"); v.Names != nil {
+		t.Fatalf("malformed names = %v", v.Names)
+	}
+	data, _ := json.Marshal(map[string]any{"entries": Entries()})
+	if !strings.Contains(string(data), `"names":{"192.0.2.3":"东京入口"}`) {
+		t.Fatalf("entries JSON = %s", data)
+	}
+	waitFor(t, 3*time.Second, "acks", func() bool {
+		_, up, _, _ := p.snapshot()
+		return hasUplink(up, "entry_ack", 2, 200) && hasUplink(up, "entry_ack", 3, 300)
+	})
+	// 同 rev 补名称不回执：rev 100 只在第一次换上时回过一次
+	if _, up, _, _ := p.snapshot(); countUplink(up, "entry_ack", 1, 100) != 1 {
+		t.Fatalf("same-rev names must not ack again: %d", countUplink(up, "entry_ack", 1, 100))
+	}
+}
+
+func TestParseNames(t *testing.T) {
+	for _, raw := range []string{``, `null`, `[]`, `"x"`, `5`, `{"a":`} {
+		if got := parseNames(json.RawMessage(raw)); got != nil {
+			t.Fatalf("parseNames(%q) = %v", raw, got)
+		}
+	}
+	got := parseNames(json.RawMessage(`{"192.0.2.1":"A","192.0.2.2":null,"192.0.2.3":{"x":1}}`))
+	if len(got) != 1 || got["192.0.2.1"] != "A" {
+		t.Fatalf("mixed = %v", got)
+	}
+	var m message
+	if err := json.Unmarshal([]byte(`{"type":"entry_failover","domain":"a","healthyIPs":["192.0.2.1"],"names":["oops"]}`), &m); err != nil {
+		t.Fatalf("malformed names must not break the message: %v", err)
+	}
+}

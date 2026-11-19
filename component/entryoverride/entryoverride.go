@@ -12,6 +12,8 @@
 //   - 多个 IP 轮流用：每次查询从下一个开始，拨号器逐个试，一个不通当场换下一个（component/dialer）。
 //   - 新集合里没有的旧 IP = 这个入口下线：经这个 server 正连着那个 IP 的连接立刻关掉（Track 登记的底层连接 +
 //     SetTrackerCloser 注册的按连接表关），应用自己会重连；上线只加 IP，不动现有连接。
+//   - 入口服务器名称（names，规格 §2.2）：IP → 主控里那台入口服务器的名字，只给界面显示（View），不参与任何匹配。
+//     只留集合里那些 IP 的；同一个 rev 的消息带了名称也换上（不算变更），新 rev 没带就清掉。见 Update.Names。
 //   - 落盘到 Load 给的路径（<数据目录>/entry-overrides.json），启动 / 重连后先用落盘的表；7 天没被快照或推送确认的过期。
 //
 // 本包不依赖拨号器、连接表与配置（它们反过来依赖本包），这些都经注册的函数接进来（component/panelrt）。
@@ -94,7 +96,8 @@ type Server struct {
 type Update struct {
 	Server  string
 	IPs     []netip.Addr
-	Ports   Ports // 零值 = 没有 ports 字段（老主控）
+	Ports   Ports             // 零值 = 没有 ports 字段（老主控）
+	Names   map[string]string // 入口服务器名称：IP 原文 → 名字；nil = 没有这个字段（普通用户 / rt 凭证的连接、老主控）
 	Rev     int64
 	ChainID int64
 	Reason  string
@@ -110,21 +113,23 @@ type Result struct {
 
 // View 给控制接口 / 界面看的一条记录。
 type View struct {
-	Server      string    `json:"server"`
-	IPs         []string  `json:"ips"`
-	Ports       *[]uint16 `json:"ports,omitempty"` // 入口端口：没有这个字段 = 主控没给（只比 server）；[] = 不匹配任何节点
-	Rev         int64     `json:"rev"`
-	ChainID     int64     `json:"chainId"`
-	Source      string    `json:"source"`
-	UpdatedAt   int64     `json:"updatedAt"`   // 本机换上这份集合的时间（毫秒）
-	ConfirmedAt int64     `json:"confirmedAt"` // 上次被主控确认的时间（毫秒）
-	Active      bool      `json:"active"`      // 当前配置里有节点的 server 等于这个键、端口也对得上（只有这时才会用它）
+	Server      string            `json:"server"`
+	IPs         []string          `json:"ips"`
+	Ports       *[]uint16         `json:"ports,omitempty"` // 入口端口：没有这个字段 = 主控没给（只比 server）；[] = 不匹配任何节点
+	Names       map[string]string `json:"names,omitempty"` // 入口服务器名称（IP → 名字，只给界面显示）；没有名字的 IP 不在表里，一个都没有时不出这个字段
+	Rev         int64             `json:"rev"`
+	ChainID     int64             `json:"chainId"`
+	Source      string            `json:"source"`
+	UpdatedAt   int64             `json:"updatedAt"`   // 本机换上这份集合的时间（毫秒）
+	ConfirmedAt int64             `json:"confirmedAt"` // 上次被主控确认的时间（毫秒）
+	Active      bool              `json:"active"`      // 当前配置里有节点的 server 等于这个键、端口也对得上（只有这时才会用它）
 }
 
 type entry struct {
 	server      string
 	ips         []netip.Addr // 空 = 撤销覆盖（只留着记 rev）
 	ports       Ports
+	names       map[netip.Addr]string // 入口服务器名称，只含 ips 里的 IP；nil = 没有
 	rev         int64
 	chainID     int64
 	source      string
@@ -342,6 +347,7 @@ func apply(source, scope, origin string, list []Update, ready bool, asOf time.Ti
 			}
 			tbl.unindexLocked(e)
 			e.ips, e.ports, e.rev, e.chainID, e.source, e.updatedAt = ips, ports, u.Rev, u.ChainID, source, t
+			e.names = normalizeNames(u.Names, ips) // 新 rev 没带名称 = 清掉旧的
 			tbl.indexLocked(e)
 			res.Applied = true
 			// 端口变了只有覆盖还在用时才值得记一行（撤销状态下端口用不上）
@@ -353,6 +359,12 @@ func apply(source, scope, origin string, list []Update, ready bool, asOf time.Ti
 				}
 				changes = append(changes, change{server: key, ips: ips, removed: removed, ports: ports, oldPorts: oldPorts,
 					portsMoved: portsMoved, closePorts: unionPorts(oldPorts, ports), rev: u.Rev, reason: u.Reason})
+			}
+		} else if u.Rev == e.rev {
+			// 同一个 rev 带了名称也换上（主控升级后连上时发的快照 rev 没变，名称靠这条补上）：不算变更、不回执、不关连接；
+			// 没带名称不动手上的（普通用户 / rt 凭证的通道收到的是不带名称的同一条）
+			if names := normalizeNames(u.Names, e.ips); names != nil && !sameNames(names, e.names) {
+				e.names = names
 			}
 		}
 		e.confirmedAt = t
@@ -427,7 +439,7 @@ func List() []View {
 		if len(e.ips) == 0 || t.Sub(e.confirmedAt) > ExpireAfter {
 			continue
 		}
-		v := View{Server: e.server, Ports: portsJSON(e.ports), Rev: e.rev, ChainID: e.chainID, Source: e.source,
+		v := View{Server: e.server, Ports: portsJSON(e.ports), Names: namesJSON(e.names), Rev: e.rev, ChainID: e.chainID, Source: e.source,
 			UpdatedAt: e.updatedAt.UnixMilli(), ConfirmedAt: e.confirmedAt.UnixMilli()}
 		for _, ip := range e.ips {
 			v.IPs = append(v.IPs, ip.String())
@@ -445,15 +457,16 @@ func List() []View {
 // MARK: - 落盘
 
 type fileEntry struct {
-	Server      string    `json:"server"`
-	IPs         []string  `json:"ips"`
-	Ports       *[]uint16 `json:"ports,omitempty"` // 没有 = 主控没给 ports（老主控 / 老落盘文件）；[] = 不匹配任何节点
-	Rev         int64     `json:"rev"`
-	ChainID     int64     `json:"chainId,omitempty"`
-	Source      string    `json:"source"`
-	Scopes      []string  `json:"scopes,omitempty"`
-	UpdatedAt   int64     `json:"updatedAt"`
-	ConfirmedAt int64     `json:"confirmedAt"`
+	Server      string            `json:"server"`
+	IPs         []string          `json:"ips"`
+	Ports       *[]uint16         `json:"ports,omitempty"` // 没有 = 主控没给 ports（老主控 / 老落盘文件）；[] = 不匹配任何节点
+	Names       map[string]string `json:"names,omitempty"` // 入口服务器名称；没有 = 没有（老落盘文件）
+	Rev         int64             `json:"rev"`
+	ChainID     int64             `json:"chainId,omitempty"`
+	Source      string            `json:"source"`
+	Scopes      []string          `json:"scopes,omitempty"`
+	UpdatedAt   int64             `json:"updatedAt"`
+	ConfirmedAt int64             `json:"confirmedAt"`
 }
 
 type fileFormat struct {
@@ -499,6 +512,7 @@ func Load(path string) error {
 			}
 		}
 		e.ips = normalizeIPs(e.ips)
+		e.names = normalizeNames(fe.Names, e.ips)
 		tbl.entries[key] = e
 		tbl.indexLocked(e)
 	}
@@ -529,7 +543,7 @@ func (t *table) saveLocked() {
 	}
 	f := fileFormat{Version: 1, Entries: []fileEntry{}}
 	for _, e := range t.entries {
-		fe := fileEntry{Server: e.server, IPs: []string{}, Ports: portsJSON(e.ports), Rev: e.rev, ChainID: e.chainID, Source: e.source,
+		fe := fileEntry{Server: e.server, IPs: []string{}, Ports: portsJSON(e.ports), Names: namesJSON(e.names), Rev: e.rev, ChainID: e.chainID, Source: e.source,
 			Scopes: e.scopes, UpdatedAt: e.updatedAt.UnixMilli(), ConfirmedAt: e.confirmedAt.UnixMilli()}
 		for _, ip := range e.ips {
 			fe.IPs = append(fe.IPs, ip.String())
@@ -635,6 +649,66 @@ func normalizePorts(p Ports) Ports {
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
 	return Ports{Set: true, List: out}
+}
+
+// MaxNameLength 入口服务器名称最多留多少个字符（规格 §2.2）。
+const MaxNameLength = 64
+
+// normalizeNames 入口服务器名称：键按 IP 规范写法、只留 ips 里有的，名字去首尾空白、截到 MaxNameLength 个字符；
+// 一个都不剩回 nil。
+func normalizeNames(raw map[string]string, ips []netip.Addr) map[netip.Addr]string {
+	if len(raw) == 0 || len(ips) == 0 {
+		return nil
+	}
+	in := map[netip.Addr]bool{}
+	for _, ip := range ips {
+		in[ip] = true
+	}
+	var out map[netip.Addr]string
+	for k, name := range raw {
+		k = strings.TrimSuffix(strings.TrimPrefix(strings.TrimSpace(k), "["), "]")
+		ip, err := netip.ParseAddr(k)
+		if err != nil {
+			continue
+		}
+		ip = ip.WithZone("").Unmap()
+		name = strings.TrimSpace(name)
+		if !in[ip] || name == "" {
+			continue
+		}
+		if r := []rune(name); len(r) > MaxNameLength {
+			name = strings.TrimSpace(string(r[:MaxNameLength]))
+		}
+		if out == nil {
+			out = map[netip.Addr]string{}
+		}
+		out[ip] = name
+	}
+	return out
+}
+
+func sameNames(a, b map[netip.Addr]string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k, v := range a {
+		if w, ok := b[k]; !ok || w != v {
+			return false
+		}
+	}
+	return true
+}
+
+// namesJSON 写成 JSON（键是 IP 的规范文本）；没有名称 = nil（不出这个字段）。
+func namesJSON(names map[netip.Addr]string) map[string]string {
+	if len(names) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(names))
+	for ip, name := range names {
+		out[ip.String()] = name
+	}
+	return out
 }
 
 func samePorts(a, b Ports) bool {

@@ -6,6 +6,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -673,4 +674,41 @@ func containsKey(t *testing.T, data []byte, key string) bool {
 	}
 	_, ok := m[key]
 	return ok
+}
+
+// 节点小标的提示文字与 SVG：名称（IP）/ IP、今天只写时刻、别的日子带日期、往年带年份；XML 转义；不做百分号编码。
+func TestProxyIconText(t *testing.T) {
+	reset(t)
+	SetServerSource(func() []Server { return []Server{{Host: "hk.test", Port: 443}} })
+	t.Cleanup(func() { SetProxyIcon(false) })
+	at := time.Date(2026, 11, 19, 15, 0, 0, 0, time.Local)
+	now = func() time.Time { return at }
+	Apply(src, ScopeUser, OriginPush, Update{Server: "hk.test", IPs: ips("203.0.113.11", "203.0.113.12"),
+		Names: map[string]string{"203.0.113.11": `A&B <入口>`}, Rev: 1})
+	if ProxyIcon("hk.test", 443) != "" {
+		t.Fatal("icon must be off by default")
+	}
+	SetProxyIcon(true)
+	got := ProxyIcon("HK.test", 443)
+	if !strings.HasPrefix(got, "data:image/svg+xml,<svg ") || strings.ContainsAny(got, "#%") {
+		t.Fatalf("icon = %s", got)
+	}
+	if !strings.Contains(got, "<title>主控指定入口 A&amp;B &lt;入口&gt;（203.0.113.11）, 203.0.113.12 · 切换于 15:00</title>") {
+		t.Fatalf("icon = %s", got)
+	}
+	if ProxyIcon("other.test", 443) != "" {
+		t.Fatal("no override, no icon")
+	}
+	sw := func(d time.Time) string {
+		return iconTitle(ips("192.0.2.1"), nil, d, at)
+	}
+	if s := sw(time.Date(2026, 11, 18, 9, 5, 0, 0, time.Local)); s != "主控指定入口 192.0.2.1 · 切换于 11-18 09:05" {
+		t.Fatalf("other day = %q", s)
+	}
+	if s := sw(time.Date(2025, 12, 31, 23, 59, 0, 0, time.Local)); s != "主控指定入口 192.0.2.1 · 切换于 2025-12-31 23:59" {
+		t.Fatalf("other year = %q", s)
+	}
+	if s := sw(time.Time{}); s != "主控指定入口 192.0.2.1" {
+		t.Fatalf("no time = %q", s)
+	}
 }

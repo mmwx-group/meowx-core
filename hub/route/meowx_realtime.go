@@ -15,10 +15,12 @@ import (
 //
 //	PUT    /meowx/realtime   panelrt.Config：{"channels":[{"base","token"|"rt"}],"hook":{"exec":[…]}|{"url":"…"},"subs":[{"base","key","rev"}]}
 //	                         或单个 {"base","token"|"rt","hook":…}；空正文 / 空列表 = 停掉。回当前状态；参数不对 400 + {"message"}
+//	                         可选 "entryIcon": true|false = 节点小标开关（缺省关，不写不改；见 entryoverride.SetProxyIcon）
 //	GET    /meowx/realtime   各通道状态（panelrt.StatusInfo）
 //	DELETE /meowx/realtime   停掉全部通道（入口覆盖表留着）
 //	GET    /meowx/entries    当前入口覆盖表 {"entries":[…]}（entryoverride.View；"ports" 没有 = 主控没给、只比 server，[] = 不匹配任何节点；
-//	                         "names" = 入口服务器名称 IP → 名字，只有管理员账号的连接才有，一个都没有时不出这个字段）
+//	                         "names" = 入口服务器名称 IP → 名字，只有管理员账号的连接才有，一个都没有时不出这个字段；
+//	                         "nodes" = 当前配置里用到这条覆盖的节点名，一个都没有时 []）
 //	DELETE /meowx/entries    清掉入口覆盖（?source=<主控地址> 只清那个主控的；退出登录、删掉那个主控的全部订阅时用）
 func meowxRealtimeRouter() http.Handler {
 	r := chi.NewRouter()

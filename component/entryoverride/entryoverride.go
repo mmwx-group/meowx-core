@@ -123,7 +123,13 @@ type View struct {
 	UpdatedAt   int64             `json:"updatedAt"`   // 本机换上这份集合的时间（毫秒）
 	ConfirmedAt int64             `json:"confirmedAt"` // 上次被主控确认的时间（毫秒）
 	Active      bool              `json:"active"`      // 当前配置里有节点的 server 等于这个键、端口也对得上（只有这时才会用它）
+	// Nodes 当前配置里用到这条覆盖的节点名（server 规范化后等于键、端口在入口端口里），按名字排序；一个都没有时 []。
+	// 给只有节点名、拿不到 server / 端口的外壳（OpenWrt LuCI、飞牛网页）认是哪个节点；由 component/panelrt.Entries 填。
+	Nodes []string `json:"nodes"`
 }
+
+// MatchPort 端口为 port 的节点用不用这条覆盖（同 Ports.Match）。
+func (v View) MatchPort(port uint16) bool { return portsFromJSON(v.Ports).Match(port) }
 
 type entry struct {
 	server      string
@@ -439,7 +445,7 @@ func List() []View {
 		if len(e.ips) == 0 || t.Sub(e.confirmedAt) > ExpireAfter {
 			continue
 		}
-		v := View{Server: e.server, Ports: portsJSON(e.ports), Names: namesJSON(e.names), Rev: e.rev, ChainID: e.chainID, Source: e.source,
+		v := View{Nodes: []string{}, Server: e.server, Ports: portsJSON(e.ports), Names: namesJSON(e.names), Rev: e.rev, ChainID: e.chainID, Source: e.source,
 			UpdatedAt: e.updatedAt.UnixMilli(), ConfirmedAt: e.confirmedAt.UnixMilli()}
 		for _, ip := range e.ips {
 			v.IPs = append(v.IPs, ip.String())

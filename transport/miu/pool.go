@@ -15,14 +15,20 @@ const (
 	// margin.
 	defaultLaneIdle = 30 * time.Second
 	warmLaneIdle    = 120 * time.Second
-	warmLanes       = 4
-	laneIdleMargin  = 5 * time.Second
+	// warmLanes raised 4→8 (pool-tuning study): a burst that starts with a non-empty
+	// pool pre-dials fewer speculative lanes, roughly halving outer handshakes on
+	// light/bursty browsing, for a few more idle sockets held <=120s.
+	warmLanes      = 8
+	laneIdleMargin = 5 * time.Second
 	// idle lanes beyond this many: the oldest is closed
 	maxIdleLanes = 32
 	// Idle lanes are only topped up to minIdle when two streams were opened
 	// within this long: the odd background connection is not worth more handshakes.
 	laneBurstWindow = 10 * time.Second
-	defaultMinIdle  = 2
+	// defaultMinIdle lowered 2→1 (pool-tuning study): the speculative background
+	// top-up is the dominant source of outer handshakes; one pre-warmed lane keeps
+	// the burst-latency win while the larger warm pool covers the rest.
+	defaultMinIdle = 1
 	// for the dials that are not made for a request: prewarming, replaying
 	dialTimeout = 10 * time.Second
 )

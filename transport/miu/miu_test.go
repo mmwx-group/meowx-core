@@ -1321,7 +1321,7 @@ func TestPrewarm(t *testing.T) {
 	// taking one has it replaced, the pool is not filled beyond minIdle
 	warm := c.idleLanes()
 	third := testOpen(t, c, echoDst)
-	if third.lane() != warm[1] {
+	if third.lane() != warm[len(warm)-1] { // the newest prewarmed lane, whatever minIdle is
 		t.Fatal("the stream should run on a prewarmed lane")
 	}
 	testEcho(t, third, []byte("warm"))

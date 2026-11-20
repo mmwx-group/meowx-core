@@ -14,6 +14,7 @@ import (
 	"github.com/metacubex/mihomo/common/utils"
 	"github.com/metacubex/mihomo/common/xsync"
 	"github.com/metacubex/mihomo/component/ca"
+	"github.com/metacubex/mihomo/component/entryoverride"
 	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/log"
 
@@ -157,6 +158,17 @@ func (p *Proxy) MarshalJSON() ([]byte, error) {
 	mapping["routing-mark"] = proxyInfo.RoutingMark
 	mapping["provider-name"] = proxyInfo.ProviderName
 	mapping["dialer-proxy"] = proxyInfo.DialerProxy
+
+	// MeowX：有生效中入口覆盖的节点带一个小标（缺省关，只给 OpenWrt 上的 zashboard 用；节点自己有 icon 时不覆盖）
+	if entryoverride.ProxyIconEnabled() {
+		if icon, _ := mapping["icon"].(string); icon == "" {
+			if host, port, err := net.SplitHostPort(p.Addr()); err == nil {
+				if icon := entryoverride.ProxyIcon(host, entryoverride.PortOf(port)); icon != "" {
+					mapping["icon"] = icon
+				}
+			}
+		}
+	}
 
 	return json.Marshal(mapping)
 }

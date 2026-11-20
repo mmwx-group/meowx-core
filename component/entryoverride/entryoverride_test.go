@@ -6,6 +6,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -579,5 +580,135 @@ func TestCloseConnectionsRespectsPorts(t *testing.T) {
 	Apply(src, ScopeUser, OriginPush, Update{Server: key, IPs: ips("198.51.100.22"), Ports: PortList(50523), Rev: 3})
 	if !old.closed() || direct.closed() {
 		t.Fatal("union of old and new ports should be used when closing")
+	}
+}
+
+func viewOf(t *testing.T, server string) View {
+	t.Helper()
+	for _, v := range List() {
+		if v.Server == server {
+			return v
+		}
+	}
+	t.Fatalf("no view for %s", server)
+	return View{}
+}
+
+// 入口服务器名称（规格 §2.2）：只留集合里的 IP、去空白截 64 字；同 rev 带了也补上（不算变更、不关连接）、
+// 同 rev 没带不动；新 rev 没带就清掉；随落盘读回；View 的 JSON 一个都没有时不出 names。
+func TestEntryNames(t *testing.T) {
+	path := reset(t)
+	closed := 0
+	SetTrackerCloser(func(string, Ports, []netip.Addr) int { closed++; return 0 })
+	key := "hk-entry.example.com"
+	long := ""
+	for i := 0; i < 70; i++ {
+		long += "名"
+	}
+	// 普通用户的连接：没有 names
+	Apply(src, ScopeUser, OriginSnapshot, Update{Server: key, IPs: ips("203.0.113.11", "203.0.113.12"), Rev: 100})
+	if v := viewOf(t, key); v.Names != nil {
+		t.Fatalf("names without field = %v", v.Names)
+	}
+	if data, _ := json.Marshal(viewOf(t, key)); json.Valid(data) && containsKey(t, data, "names") {
+		t.Fatalf("view JSON must omit names: %s", data)
+	}
+	// 主控升级后同一个 rev 的快照带上名称：补上，不算变更
+	r := Apply(src, ScopeUser, OriginSnapshot, Update{Server: key, IPs: ips("203.0.113.11", "203.0.113.12"), Rev: 100,
+		Names: map[string]string{" 203.0.113.11 ": "  香港入口 A  ", "203.0.113.99": "不在集合里", "203.0.113.12": "   ", "bad": "x"}})
+	if r.Applied {
+		t.Fatalf("same rev with names must not count as applied: %+v", r)
+	}
+	if v := viewOf(t, key); len(v.Names) != 1 || v.Names["203.0.113.11"] != "香港入口 A" {
+		t.Fatalf("names after same-rev = %v", v.Names)
+	}
+	// 同 rev 没带名称（rt 凭证的通道）：不动
+	Apply(src, "rt:x", OriginSnapshot, Update{Server: key, IPs: ips("203.0.113.11", "203.0.113.12"), Rev: 100})
+	if v := viewOf(t, key); v.Names["203.0.113.11"] != "香港入口 A" {
+		t.Fatalf("same rev without names must keep them: %v", v.Names)
+	}
+	// 新 rev：名称跟着新集合走，超长截到 64 字
+	Apply(src, ScopeUser, OriginPush, Update{Server: key, IPs: ips("203.0.113.12"), Rev: 200,
+		Names: map[string]string{"203.0.113.12": long, "203.0.113.11": "已下线"}})
+	if v := viewOf(t, key); len(v.Names) != 1 || len([]rune(v.Names["203.0.113.12"])) != MaxNameLength {
+		t.Fatalf("names after new rev = %v", v.Names)
+	}
+	// 落盘读回
+	if err := Load(filepath.Join(t.TempDir(), "other.json")); err != nil {
+		t.Fatal(err)
+	}
+	if err := Load(path); err != nil {
+		t.Fatal(err)
+	}
+	if v := viewOf(t, key); len([]rune(v.Names["203.0.113.12"])) != MaxNameLength {
+		t.Fatalf("names after reload = %v", v.Names)
+	}
+	// 新 rev 没带名称：清掉
+	Apply(src, ScopeUser, OriginPush, Update{Server: key, IPs: ips("203.0.113.12"), Rev: 300})
+	if v := viewOf(t, key); v.Names != nil {
+		t.Fatalf("new rev without names must clear them: %v", v.Names)
+	}
+	if closed != 1 {
+		t.Fatalf("only the rev-200 removal closes connections, closer called %d times", closed)
+	}
+	// 老落盘文件（没有 names）读进来 = 没有
+	old := `{"version":1,"entries":[{"server":"old.test","ips":["192.0.2.1"],"rev":1,"source":"s","updatedAt":` +
+		jsonInt(time.Now().UnixMilli()) + `,"confirmedAt":` + jsonInt(time.Now().UnixMilli()) + `}]}`
+	oldPath := filepath.Join(t.TempDir(), "old.json")
+	if err := os.WriteFile(oldPath, []byte(old), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := Load(oldPath); err != nil {
+		t.Fatal(err)
+	}
+	if v := viewOf(t, "old.test"); v.Names != nil {
+		t.Fatalf("old file names = %v", v.Names)
+	}
+}
+
+func containsKey(t *testing.T, data []byte, key string) bool {
+	t.Helper()
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(data, &m); err != nil {
+		t.Fatal(err)
+	}
+	_, ok := m[key]
+	return ok
+}
+
+// 节点小标的提示文字与 SVG：名称（IP）/ IP、今天只写时刻、别的日子带日期、往年带年份；XML 转义；不做百分号编码。
+func TestProxyIconText(t *testing.T) {
+	reset(t)
+	SetServerSource(func() []Server { return []Server{{Host: "hk.test", Port: 443}} })
+	t.Cleanup(func() { SetProxyIcon(false) })
+	at := time.Date(2026, 11, 19, 15, 0, 0, 0, time.Local)
+	now = func() time.Time { return at }
+	Apply(src, ScopeUser, OriginPush, Update{Server: "hk.test", IPs: ips("203.0.113.11", "203.0.113.12"),
+		Names: map[string]string{"203.0.113.11": `A&B <入口>`}, Rev: 1})
+	if ProxyIcon("hk.test", 443) != "" {
+		t.Fatal("icon must be off by default")
+	}
+	SetProxyIcon(true)
+	got := ProxyIcon("HK.test", 443)
+	if !strings.HasPrefix(got, "data:image/svg+xml,<svg ") || strings.ContainsAny(got, "#%") {
+		t.Fatalf("icon = %s", got)
+	}
+	if !strings.Contains(got, "<title>主控指定入口 A&amp;B &lt;入口&gt;（203.0.113.11）, 203.0.113.12 · 切换于 15:00</title>") {
+		t.Fatalf("icon = %s", got)
+	}
+	if ProxyIcon("other.test", 443) != "" {
+		t.Fatal("no override, no icon")
+	}
+	sw := func(d time.Time) string {
+		return iconTitle(ips("192.0.2.1"), nil, d, at)
+	}
+	if s := sw(time.Date(2026, 11, 18, 9, 5, 0, 0, time.Local)); s != "主控指定入口 192.0.2.1 · 切换于 11-18 09:05" {
+		t.Fatalf("other day = %q", s)
+	}
+	if s := sw(time.Date(2025, 12, 31, 23, 59, 0, 0, time.Local)); s != "主控指定入口 192.0.2.1 · 切换于 2025-12-31 23:59" {
+		t.Fatalf("other year = %q", s)
+	}
+	if s := sw(time.Time{}); s != "主控指定入口 192.0.2.1" {
+		t.Fatalf("no time = %q", s)
 	}
 }

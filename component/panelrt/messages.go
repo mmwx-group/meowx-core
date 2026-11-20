@@ -21,6 +21,7 @@ type message struct {
 	Rev        json.RawMessage    `json:"rev"`
 	Reason     string             `json:"reason"`
 	Ports      *[]json.RawMessage `json:"ports"` // 入口端口；没有这个字段（老主控）= 只比 server，[] = 不匹配任何节点
+	Names      json.RawMessage    `json:"names"` // 入口服务器名称（IP → 名字）；收原样，形状不对只丢这个字段（parseNames）
 	Ready      *bool              `json:"ready"`
 	Entries    []snapshotEntry    `json:"entries"`
 	Subs       *[]rawSubRev       `json:"subs"` // 没有这个字段（旧主控）= 这个主控来的全部订阅
@@ -32,6 +33,7 @@ type snapshotEntry struct {
 	IPs     []string           `json:"ips"`
 	Rev     json.RawMessage    `json:"rev"`
 	Ports   *[]json.RawMessage `json:"ports"` // 同 message.Ports
+	Names   json.RawMessage    `json:"names"` // 同 message.Names
 }
 
 type rawSubRev struct {
@@ -100,6 +102,31 @@ func parsePorts(raw *[]json.RawMessage) entryoverride.Ports {
 	return entryoverride.PortList(list...)
 }
 
+// parseNames 入口服务器名称（规格 §2.2，只给界面显示）：对象，IP → 名字。只有管理员账号的连接才有这个字段。
+// 不是对象回 nil（只丢这个字段，整条消息照常处理）；值不是字符串的那一项跳过。键与名字的规范化在 entryoverride 里做。
+func parseNames(raw json.RawMessage) map[string]string {
+	raw = bytes.TrimSpace(raw)
+	if len(raw) == 0 || raw[0] != '{' {
+		return nil
+	}
+	var obj map[string]json.RawMessage
+	if json.Unmarshal(raw, &obj) != nil {
+		return nil
+	}
+	var out map[string]string
+	for k, v := range obj {
+		var name string
+		if json.Unmarshal(v, &name) != nil || name == "" { // null 解出来也是空串
+			continue
+		}
+		if out == nil {
+			out = map[string]string{}
+		}
+		out[k] = name
+	}
+	return out
+}
+
 // ack 回执（规格 §2.5）：应用完一个键的变更后发 {"type":"entry_ack","chainId","rev"}。
 type ack struct {
 	ChainID int64
@@ -120,7 +147,7 @@ func (c *channel) handleMessage(m *message, origin string, received time.Time) [
 		}
 		chainID, _ := parseInt64(m.ChainID)
 		res := entryoverride.Apply(c.cfg.Base, c.scope, origin, entryoverride.Update{
-			Server: m.Domain, IPs: parseIPs(m.HealthyIPs), Ports: parsePorts(m.Ports), Rev: rev, ChainID: chainID, Reason: m.Reason})
+			Server: m.Domain, IPs: parseIPs(m.HealthyIPs), Ports: parsePorts(m.Ports), Names: parseNames(m.Names), Rev: rev, ChainID: chainID, Reason: m.Reason})
 		// 推送的决定本机已经在用了（刚换上，或者之前就收到过）才回执；旧主控不带 rev，不回
 		if hasRev && res.Server != "" && res.Rev >= rev {
 			return []ack{{ChainID: chainID, Rev: rev}}
@@ -160,7 +187,7 @@ func (c *channel) applySnapshot(ready bool, entries []snapshotEntry, origin stri
 		}
 		chainID, _ := parseInt64(e.ChainID)
 		list = append(list, entryoverride.Update{Server: e.Server, IPs: parseIPs(e.IPs), Ports: parsePorts(e.Ports),
-			Rev: rev, ChainID: chainID})
+			Names: parseNames(e.Names), Rev: rev, ChainID: chainID})
 	}
 	results := entryoverride.ApplySnapshot(c.cfg.Base, c.scope, origin, ready, asOf, list)
 	var acks []ack

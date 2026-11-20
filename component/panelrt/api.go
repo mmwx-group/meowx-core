@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"net/url"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -73,9 +74,12 @@ type Config struct {
 	Channels []Channel `json:"channels,omitempty"`
 	Hook     *Hook     `json:"hook,omitempty"`
 	Subs     []SubRev  `json:"subs,omitempty"` // 可选：外壳手上各订阅的 rev（键与 rev 来自拉订阅时的 mmwx-sub-key / mmwx-sub-rev 头）
-	Base     string    `json:"base,omitempty"`
-	Token    string    `json:"token,omitempty"`
-	RT       string    `json:"rt,omitempty"`
+	// EntryIcon 可选：节点小标开关（见 entryoverride.SetProxyIcon，缺省关；只给 OpenWrt 上的 zashboard 用）。
+	// 不写 = 不改现在的设置；DELETE /meowx/realtime 也不改。
+	EntryIcon *bool  `json:"entryIcon,omitempty"`
+	Base      string `json:"base,omitempty"`
+	Token     string `json:"token,omitempty"`
+	RT        string `json:"rt,omitempty"`
 }
 
 // ChannelStatus 一条通道的状态（不含凭证）。时间都是毫秒时间戳，0 = 没有。
@@ -98,6 +102,8 @@ type ChannelStatus struct {
 type StatusInfo struct {
 	Channels []ChannelStatus `json:"channels"`
 	Hook     *Hook           `json:"hook,omitempty"`
+	// EntryIcon 节点小标开着没有（PUT 的 "entryIcon"）
+	EntryIcon bool `json:"entryIcon,omitempty"`
 }
 
 type manager struct {
@@ -246,6 +252,9 @@ func ApplyConfig(cfg Config) error {
 	if err := Configure(channels, cfg.Hook); err != nil {
 		return err
 	}
+	if cfg.EntryIcon != nil {
+		entryoverride.SetProxyIcon(*cfg.EntryIcon)
+	}
 	for _, s := range cfg.Subs {
 		NoteSubscriptionRev(s.Base, s.Key, s.Rev)
 	}
@@ -261,7 +270,7 @@ func Stop() {
 func Status() StatusInfo {
 	mgr.mu.Lock()
 	chans := append([]*channel(nil), mgr.channels...)
-	info := StatusInfo{Channels: []ChannelStatus{}, Hook: mgr.hook}
+	info := StatusInfo{Channels: []ChannelStatus{}, Hook: mgr.hook, EntryIcon: entryoverride.ProxyIconEnabled()}
 	mgr.mu.Unlock()
 	for _, c := range chans {
 		c.mu.Lock()
@@ -275,9 +284,34 @@ func Status() StatusInfo {
 }
 
 // Entries 当前的入口覆盖表。
+// 每条带上当前配置里用到它的节点名（Nodes）。
 func Entries() []entryoverride.View {
 	ensureState()
-	return entryoverride.List()
+	views := entryoverride.List()
+	if len(views) == 0 {
+		return views
+	}
+	byKey := map[string][]int{}
+	for i, v := range views {
+		byKey[v.Server] = append(byKey[v.Server], i)
+	}
+	seen := map[string]bool{}
+	eachProxy(func(p C.Proxy) {
+		h, port := proxyHost(p)
+		if h == "" || seen[p.Name()] {
+			return
+		}
+		for _, i := range byKey[h] {
+			if views[i].MatchPort(port) {
+				seen[p.Name()] = true
+				views[i].Nodes = append(views[i].Nodes, p.Name())
+			}
+		}
+	})
+	for i := range views {
+		sort.Strings(views[i].Nodes)
+	}
+	return views
 }
 
 // SetSubscriptionCallback 订阅变更回调（meowC 经桥接回 Dart）：主控 base 上键为 key 的订阅现在是 rev（key 为空 = 这个主控来的全部订阅）。

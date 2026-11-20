@@ -79,7 +79,8 @@ func TestPanelReportTargetHidesToken(t *testing.T) {
 			w.WriteHeader(http.StatusBadRequest)
 			return
 		}
-		w.WriteHeader(http.StatusOK)
+		// po0 的 200 应答带着名单（规格 po0-ggy-results.md §1）：名单里有本机才算加白成功
+		_, _ = w.Write([]byte(`{"enabled":true,"whitelist":["127.0.0.1"],"limit":5,"currentIp":"127.0.0.1"}`))
 	}))
 	defer srv.Close()
 	host := strings.TrimPrefix(srv.URL, "https://")

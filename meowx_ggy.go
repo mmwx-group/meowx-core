@@ -3,9 +3,10 @@ package main
 // GGY 加白（同客户端「GGY 加白」）：GGY（咕咕云）「腾讯云 ECS 防火墙」插件的白名单分享链接——谁打开它，就把发起请求的
 // 公网 IP 加进那台服务器的防火墙白名单。节点在 GGY 的服务器上时，路由器要定期用自己的直连出口 IP 打开它（与 po0 加白同一类）。
 //
-//	meowx-core panel ggy status | enable | disable | add <token 或整条分享链接> | remove <序号> | report
+//	meowx-core panel ggy status | enable | disable | add <token 或整条分享链接> [备注] | note <序号> [备注] | remove <序号> | report
 //
-// 开关与 token 列表存 uci（meowx.ggy：option enabled、list token），本机偏好：退出登录不清、没登录也报。上一次的结果只放
+// 开关与 token 列表存 uci（meowx.ggy：option enabled、list token；备注是 option note_<token 哈希>），本机偏好：退出登录不清、没登录也报。
+// 上一次的结果只放
 // 内存盘（/var/run/meowx/ggy.json，按 token 的哈希记），重启后显示「还没报过」，免得每 10 分钟写一次闪存。
 // 回给界面（rpcd）与写进日志的 token 一律是脱敏写法。
 
@@ -226,11 +227,24 @@ func ggyRedact(text, token string) string {
 	return strings.ReplaceAll(text, token, maskGGYToken(token))
 }
 
+// kind 与客户端同名：success / invalidToken / failed（ok / invalid 留着给老界面）；msg = 成功时 GGY 回的 msg（已脱敏）
 type ggyResult struct {
+	Kind    string `json:"kind,omitempty"`
 	OK      bool   `json:"ok"`
 	Invalid bool   `json:"invalid,omitempty"`
 	Error   string `json:"error,omitempty"`
+	Msg     string `json:"msg,omitempty"`
 	At      int64  `json:"at"`
+}
+
+func ggyResultOf(o ggyOutcome, at int64) ggyResult {
+	switch {
+	case o.OK:
+		return ggyResult{Kind: "success", OK: true, Msg: o.Reason, At: at}
+	case o.Invalid:
+		return ggyResult{Kind: "invalidToken", Invalid: true, Error: o.Reason, At: at}
+	}
+	return ggyResult{Kind: "failed", Error: o.Reason, At: at}
 }
 
 // 每个 token 各报一次（并发：开关打开 / 添加时由界面同步等结果，最多 10 秒），结果记进内存盘、每个一行写进插件日志
@@ -254,10 +268,8 @@ func ggyReport(tokens []string) []map[string]any {
 		o := outcomes[i]
 		masked := maskGGYToken(token)
 		res := map[string]any{"kind": "ggy", "token": masked, "ok": o.OK}
-		if o.OK {
-			saved[ggyKey(token)] = ggyResult{OK: true, At: now}
-		} else {
-			saved[ggyKey(token)] = ggyResult{Invalid: o.Invalid, Error: o.Reason, At: now}
+		saved[ggyKey(token)] = ggyResultOf(o, now)
+		if !o.OK {
 			res["error"] = o.Reason
 			if o.Invalid {
 				res["invalid"] = true
@@ -297,6 +309,20 @@ func ggyLog(lines []string) {
 type ggyConfig struct {
 	Enabled bool
 	Tokens  []string
+	Notes   map[string]string // 备注：键是 ggyKey(token)，只存本机、不进上报请求
+}
+
+func (cfg ggyConfig) note(token string) string { return cfg.Notes[ggyKey(token)] }
+
+func (cfg *ggyConfig) setNote(token, note string) {
+	if note == "" {
+		delete(cfg.Notes, ggyKey(token))
+		return
+	}
+	if cfg.Notes == nil {
+		cfg.Notes = map[string]string{}
+	}
+	cfg.Notes[ggyKey(token)] = note
 }
 
 func ggyUCI(args ...string) (string, error) {
@@ -306,8 +332,9 @@ func ggyUCI(args ...string) (string, error) {
 
 // 没有 uci 的外壳（飞牛 NAS 版）：开关与 token 列表存这个 JSON 文件（MEOWX_GGY_STATE）
 type ggyFileState struct {
-	Enabled bool     `json:"enabled"`
-	Tokens  []string `json:"tokens"`
+	Enabled bool              `json:"enabled"`
+	Tokens  []string          `json:"tokens"`
+	Notes   map[string]string `json:"notes,omitempty"` // 备注，键是 ggyKey(token)；老文件没有 = 都没有备注
 }
 
 func loadGGYConfig() ggyConfig {
@@ -321,6 +348,9 @@ func loadGGYConfig() ggyConfig {
 		for _, t := range st.Tokens {
 			if ggyTokenPattern.MatchString(t) && !ggyContains(cfg.Tokens, t) {
 				cfg.Tokens = append(cfg.Tokens, t)
+				if n, err := normalizeNote(st.Notes[ggyKey(t)]); err == nil {
+					cfg.setNote(t, n)
+				}
 			}
 		}
 		return cfg
@@ -334,6 +364,11 @@ func loadGGYConfig() ggyConfig {
 		for _, t := range strings.Fields(v) {
 			if ggyTokenPattern.MatchString(t) && !ggyContains(cfg.Tokens, t) {
 				cfg.Tokens = append(cfg.Tokens, t)
+				if v, err := ggyUCI("get", "meowx.ggy.note_"+ggyKey(t)); err == nil {
+					if n, err := normalizeNote(v); err == nil {
+						cfg.setNote(t, n)
+					}
+				}
 			}
 		}
 	}
@@ -342,7 +377,13 @@ func loadGGYConfig() ggyConfig {
 
 func (cfg ggyConfig) save() error {
 	if path := os.Getenv("MEOWX_GGY_STATE"); path != "" {
-		data, err := json.Marshal(ggyFileState{Enabled: cfg.Enabled, Tokens: cfg.Tokens})
+		notes := map[string]string{}
+		for _, t := range cfg.Tokens {
+			if n := cfg.note(t); n != "" {
+				notes[ggyKey(t)] = n
+			}
+		}
+		data, err := json.Marshal(ggyFileState{Enabled: cfg.Enabled, Tokens: cfg.Tokens, Notes: notes})
 		if err != nil {
 			return err
 		}
@@ -378,11 +419,30 @@ func (cfg ggyConfig) save() error {
 			return err
 		}
 	}
+	// 备注：先删掉全部 note_*（含已删 token 留下的），再按现有 token 写回
+	if out, err := ggyUCI("show", "meowx.ggy"); err == nil {
+		for _, line := range strings.Split(out, "\n") {
+			if name, _, ok := strings.Cut(strings.TrimPrefix(line, "meowx.ggy."), "="); ok && strings.HasPrefix(name, "note_") {
+				_, _ = ggyUCI("delete", "meowx.ggy."+name)
+			}
+		}
+	}
+	for _, t := range cfg.Tokens {
+		if n := cfg.note(t); n != "" {
+			if err := run("set", "meowx.ggy.note_"+ggyKey(t)+"="+n); err != nil {
+				return err
+			}
+		}
+	}
 	return run("commit", "meowx")
 }
 
 // 加进列表（不落盘）：解析 / 校验输入，去重按规范化后的 token，最多 20 个
 func (cfg *ggyConfig) add(input string) (string, error) {
+	return cfg.addWithNote(input, "")
+}
+
+func (cfg *ggyConfig) addWithNote(input, note string) (string, error) {
 	if strings.TrimSpace(input) == "" {
 		return "", errors.New("请填写 token")
 	}
@@ -397,6 +457,7 @@ func (cfg *ggyConfig) add(input string) (string, error) {
 		return "", fmt.Errorf("最多添加 %d 个 token", ggyMaxTokens)
 	}
 	cfg.Tokens = append(cfg.Tokens, token)
+	cfg.setNote(token, note)
 	return token, nil
 }
 
@@ -468,9 +529,16 @@ func ggyMain(args []string) (any, error) {
 		}
 	case "add":
 		if len(args) < 2 {
-			return nil, errors.New("用法：ggy add <token 或分享链接>")
+			return nil, errors.New("用法：ggy add <token 或分享链接> [备注]")
 		}
-		token, err := cfg.add(args[1])
+		note := ""
+		if len(args) > 2 {
+			var err error
+			if note, err = normalizeNote(args[2]); err != nil {
+				return nil, err
+			}
+		}
+		token, err := cfg.addWithNote(args[1], note)
 		if err != nil {
 			return nil, err
 		}
@@ -489,11 +557,31 @@ func ggyMain(args []string) (any, error) {
 		if err != nil || i < 0 || i >= len(cfg.Tokens) {
 			return nil, errors.New("没有这一项")
 		}
+		cfg.setNote(cfg.Tokens[i], "")
 		cfg.Tokens = append(cfg.Tokens[:i], cfg.Tokens[i+1:]...)
 		if err := cfg.save(); err != nil {
 			return nil, err
 		}
 		saveGGYResults(loadGGYResults(), cfg.Tokens)
+	case "note":
+		// 改备注（空 = 清除）：只改本机存的备注，不触发上报
+		if len(args) < 2 {
+			return nil, errors.New("用法：ggy note <序号> [备注]")
+		}
+		i, err := strconv.Atoi(args[1])
+		if err != nil || i < 0 || i >= len(cfg.Tokens) {
+			return nil, errors.New("没有这一项")
+		}
+		note := ""
+		if len(args) > 2 {
+			if note, err = normalizeNote(args[2]); err != nil {
+				return nil, err
+			}
+		}
+		cfg.setNote(cfg.Tokens[i], note)
+		if err := cfg.save(); err != nil {
+			return nil, err
+		}
 	case "report":
 		if cfg.Enabled {
 			reportNow = cfg.Tokens
@@ -512,7 +600,7 @@ func ggyStatus(cfg ggyConfig, results []map[string]any) map[string]any {
 	saved := loadGGYResults()
 	tokens := make([]map[string]any, 0, len(cfg.Tokens))
 	for _, t := range cfg.Tokens {
-		entry := map[string]any{"token": maskGGYToken(t)}
+		entry := map[string]any{"token": maskGGYToken(t), "note": cfg.note(t)}
 		if r, ok := saved[ggyKey(t)]; ok {
 			entry["result"] = r
 		}

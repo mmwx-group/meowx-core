@@ -55,7 +55,7 @@ func ProxyIcon(host string, port uint16) string {
 }
 
 // iconTitle 悬停提示：「主控指定入口 香港入口 A（203.0.113.11）, 203.0.113.12 · 切换于 14:05」。
-// 有名称写「名称（IP）」，没名称只写 IP；时间按本机时区，今天只写时刻，今年别的日子带月日，往年带年份。
+// 有名称写「名称（IP）」，没名称只写 IP；时间按显示时区（displayZone，OpenWrt 上取 /etc/TZ），今天只写时刻，今年别的日子带月日，往年带年份。
 func iconTitle(ips []netip.Addr, names map[netip.Addr]string, switched, at time.Time) string {
 	parts := make([]string, len(ips))
 	for i, ip := range ips {
@@ -69,7 +69,8 @@ func iconTitle(ips []netip.Addr, names map[netip.Addr]string, switched, at time.
 	if switched.IsZero() || switched.Unix() <= 0 {
 		return s
 	}
-	sw, cur := switched.Local(), at.Local()
+	zone := displayZone()
+	sw, cur := switched.In(zone), at.In(zone)
 	layout := "15:04"
 	switch {
 	case sw.Year() != cur.Year():

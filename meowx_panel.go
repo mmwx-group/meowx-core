@@ -5,8 +5,9 @@ package main
 //
 //	meowx-core panel login 'miaomiaowu://login?host=…&code=…'
 //	meowx-core panel status | profile | subscriptions | firewall | report | logout
-//	meowx-core panel po0 status | enable | disable | fetch | add <地址> <token> | remove <序号>
-//	meowx-core panel ggy status | enable | disable | add <token 或分享链接> | remove <序号> | report（meowx_ggy.go）
+//	meowx-core panel po0 status | enable | disable | fetch | add <地址> <token> [备注] | note <序号> [备注] | remove <序号>
+//	                                                       （结果与备注见 meowx_po0result.go）
+//	meowx-core panel ggy status | enable | disable | add <token 或分享链接> [备注] | note <序号> [备注] | remove <序号> | report（meowx_ggy.go）
 //	meowx-core panel akile status | enable | disable | setkey … | clearkey | nodes … | rules … | add … | remove … | report [--timer]
 //	                                                       （AkileCDN 白名单，meowx_akile.go）
 //	meowx-core panel mesh status | sites … | enroll … | devices | delete …（喵窝，meowx_mesh.go）
@@ -136,6 +137,9 @@ func panelMain(args []string) int {
 	}
 	if v := os.Getenv("MEOWX_GGY_RESULTS"); v != "" {
 		ggyResultPath = v
+	}
+	if v := os.Getenv("MEOWX_PO0_RESULTS"); v != "" {
+		po0ResultPath = v
 	}
 	if v := os.Getenv("MEOWX_APP_LOG"); v != "" {
 		ggyAppLogPath = v
@@ -503,9 +507,18 @@ func panelReport() (any, error) {
 		if st != nil && time.Now().Unix()-po.PanelFetchedAt > 6*3600 {
 			_, _ = po0Fetch(st, po) // 列表 6 小时没刷新就顺带重取（管理员可能在主控加减了 po0）
 		}
-		for _, u := range po.reportURLs() {
-			results = append(results, reportTarget("po0", u, true)...)
+		urls := po.reportURLs()
+		saved := loadPo0Results()
+		now := time.Now().Unix()
+		for _, u := range urls {
+			out, r := reportTargetResult("po0", u, true)
+			results = append(results, out...)
+			if r != nil {
+				r.At = now
+				saved[po0ResultKey(u)] = *r
+			}
 		}
+		savePo0Results(saved, urls)
 	}
 	// 主控与 po0 的结果写进插件日志（GGY / AkileCDN 各自写）：以前一行不记，加白时好时坏查不出是哪一环（#1779）
 	ggyLog(reportLogLines(results))
@@ -522,9 +535,20 @@ func panelReport() (any, error) {
 }
 
 func reportTarget(kind, target string, po0 bool) []map[string]any {
+	out, _ := reportTargetResult(kind, target, po0)
+	return out
+}
+
+// 同 reportTarget，po0 另外回这台 po0 的判定结果（IPv4 / IPv6 两发里挑一个，见 po0PickResult；时间由调用方填）。
+// po0 的 ok = 判定为「已加白」：200 但防火墙没开 / 名单里没有本机都不算成功，写进日志的是具体原因
+func reportTargetResult(kind, target string, po0 bool) ([]map[string]any, *po0Result) {
 	u, err := url.Parse(target)
 	if err != nil {
-		return []map[string]any{{"kind": kind, "ok": false, "error": err.Error()}}
+		if po0 {
+			r := po0Result{Kind: po0KindFailed, Message: redactPo0Tokens(err.Error())}
+			return []map[string]any{{"kind": kind, "ok": false, "error": r.Message}}, &r
+		}
+		return []map[string]any{{"kind": kind, "ok": false, "error": err.Error()}}, nil
 	}
 	families := []string{"tcp4", "tcp6"}
 	if ip := net.ParseIP(u.Hostname()); ip != nil {
@@ -535,22 +559,53 @@ func reportTarget(kind, target string, po0 bool) []map[string]any {
 		}
 	}
 	var out []map[string]any
+	var judged []po0Result
+	slot := po0SlotFromURL(target)
+	label := ""
+	if po0 {
+		label = po0URLLabel(u) // 同一台 po0 可能有几个 token：日志里按「地址 + 脱敏 token」分开
+	}
 	for _, family := range families {
 		res := map[string]any{"kind": kind, "host": u.Host, "family": family}
-		status, err := reportOnce(target, family, po0)
+		if label != "" {
+			res["token"] = label
+		}
+		status, body, err := reportOnce(target, family, po0)
+		if po0 {
+			var r po0Result
+			if err != nil {
+				r = po0Result{Kind: po0KindFailed, Message: redactPo0Tokens(reportErrorText(err)), Slot: slot}
+			} else {
+				r = judgePo0Response(status, body, slot)
+				r.Message = redactPo0Tokens(r.Message)
+			}
+			judged = append(judged, r)
+			res["po0_kind"] = r.Kind
+			switch r.Kind {
+			case po0KindSuccess:
+				res["ok"] = true
+			case po0KindFailed:
+				res["ok"], res["error"] = false, r.Message
+			default:
+				res["ok"], res["error"] = false, po0ResultText(r)
+			}
+			out = append(out, res)
+			continue
+		}
 		switch {
 		case err != nil:
 			res["ok"], res["error"] = false, reportErrorText(err)
 		case status == http.StatusOK:
 			res["ok"] = true
-		case status == http.StatusForbidden && po0:
-			res["ok"], res["error"] = false, "token 无效（403），到主控里重新登记这台 po0"
 		default:
 			res["ok"], res["error"] = false, fmt.Sprintf("HTTP %d", status)
 		}
 		out = append(out, res)
 	}
-	return out
+	if r, ok := po0PickResult(judged); ok {
+		return out, &r
+	}
+	return out, nil
 }
 
 // http.Client 的错误是 `Post "<地址>": <原因>`，上报地址里带着完整 token（主控 /api/fw/<token>/add、po0 /api/firewall/<token>/add）：
@@ -579,6 +634,9 @@ func reportLogLines(results []map[string]any) []string {
 			continue
 		}
 		host, _ := r["host"].(string)
+		if token, _ := r["token"].(string); token != "" {
+			host += " " + token
+		}
 		t := byKey[kind+"|"+host]
 		if t == nil {
 			t = &target{kind: kind, host: host}
@@ -614,7 +672,8 @@ func reportLogLines(results []map[string]any) []string {
 	return lines
 }
 
-func reportOnce(target, family string, po0 bool) (int, error) {
+// 一次上报：回状态码与应答开头（最多 64KB；po0 的 200 应答带着整份白名单，要拿来判定）
+func reportOnce(target, family string, po0 bool) (int, []byte, error) {
 	transport := &http.Transport{
 		Proxy: nil,
 		DialContext: func(ctx context.Context, _, addr string) (net.Conn, error) {
@@ -628,7 +687,7 @@ func reportOnce(target, family string, po0 bool) (int, error) {
 	client := &http.Client{Timeout: 15 * time.Second, Transport: transport}
 	req, err := http.NewRequest("POST", target, nil)
 	if err != nil {
-		return 0, err
+		return 0, nil, err
 	}
 	req.Header.Set("Content-Length", "0")
 	if po0 {
@@ -636,11 +695,11 @@ func reportOnce(target, family string, po0 bool) (int, error) {
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		return 0, err
+		return 0, nil, err
 	}
 	defer resp.Body.Close()
-	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
-	return resp.StatusCode, nil
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+	return resp.StatusCode, body, nil
 }
 
 // ---------- po0 加白（同客户端「po0 加白」：主控下发的 + 自己添加的，总开关缺省关）----------
@@ -650,6 +709,7 @@ var po0StatePath = "/etc/meowx/po0.json"
 type po0Custom struct {
 	Address string `json:"address"`
 	Token   string `json:"token"`
+	Note    string `json:"note,omitempty"` // 备注（只存本机，不进上报请求；老文件没有 = 没有备注）
 }
 
 type po0PanelServer struct {
@@ -710,7 +770,12 @@ func (po *po0State) save() error {
 	if err := os.WriteFile(tmp, data, 0o600); err != nil {
 		return err
 	}
-	return os.Rename(tmp, po0StatePath)
+	if err := os.Rename(tmp, po0StatePath); err != nil {
+		return err
+	}
+	// 上报列表变了（删了服务器、关了总开关、主控列表换了）：对应的结果一起删
+	savePo0Results(loadPo0Results(), po.ReportURLs)
+	return nil
 }
 
 func po0Main(args []string) (any, error) {
@@ -741,7 +806,14 @@ func po0Main(args []string) (any, error) {
 		}
 	case "add":
 		if len(args) < 3 {
-			return nil, errors.New("用法：po0 add <地址> <token>")
+			return nil, errors.New("用法：po0 add <地址> <token> [备注]")
+		}
+		note := ""
+		if len(args) > 3 {
+			var err error
+			if note, err = normalizeNote(args[3]); err != nil {
+				return nil, err
+			}
 		}
 		address := normalizePo0Address(args[1])
 		if address == "" {
@@ -755,9 +827,12 @@ func po0Main(args []string) (any, error) {
 		// po0 的加白地址可能相同而 token 不同（几份套餐共用一台 po0），得用不同 token 各报一次；
 		// reportURLs() 按含 token 的完整上报 URL 去重，两条都会报。以前只按地址去重、把 token 换掉，少报了。
 		exists := false
-		for _, c := range po.Custom {
+		for i, c := range po.Custom {
 			if c.Address == address && c.Token == token {
 				exists = true
+				if note != "" {
+					po.Custom[i].Note = note // 重复添加时带了备注：只更新备注
+				}
 				break
 			}
 		}
@@ -765,8 +840,24 @@ func po0Main(args []string) (any, error) {
 			if len(po.Custom) >= 16 {
 				return nil, errors.New("最多 16 台") // 同客户端 UserOverridesStore.maxEntries
 			}
-			po.Custom = append(po.Custom, po0Custom{Address: address, Token: token})
+			po.Custom = append(po.Custom, po0Custom{Address: address, Token: token, Note: note})
 		}
+	case "note":
+		// 改备注（空 = 清除）：只改本机存的备注，不触发上报
+		if len(args) < 2 {
+			return nil, errors.New("用法：po0 note <序号> [备注]")
+		}
+		i, err := strconv.Atoi(args[1])
+		if err != nil || i < 0 || i >= len(po.Custom) {
+			return nil, errors.New("没有这一项")
+		}
+		note := ""
+		if len(args) > 2 {
+			if note, err = normalizeNote(args[2]); err != nil {
+				return nil, err
+			}
+		}
+		po.Custom[i].Note = note
 	case "remove":
 		if len(args) < 2 {
 			return nil, errors.New("用法：po0 remove <序号>")
@@ -784,10 +875,21 @@ func po0Main(args []string) (any, error) {
 			return nil, err
 		}
 	}
-	// 界面只拿脱敏的 token（完整的只在路由器上）
+	// 界面只拿脱敏的 token（完整的只在路由器上）；每台带上一次上报的结果（没有 = 还没报过）与上报用的槽位
+	results := loadPo0Results()
+	withResult := func(m map[string]any, reportURL string) map[string]any {
+		m["slot"] = po0SlotFromURL(reportURL)
+		if reportURL != "" && po.Enabled {
+			if r, ok := results[po0ResultKey(reportURL)]; ok {
+				m["result"] = r
+			}
+		}
+		return m
+	}
 	custom := make([]map[string]any, 0, len(po.Custom))
 	for _, c := range po.Custom {
-		custom = append(custom, map[string]any{"address": c.Address, "token": maskPo0Token(c.Token)})
+		custom = append(custom, withResult(map[string]any{"address": c.Address, "token": maskPo0Token(c.Token), "note": c.Note},
+			po0ReportURL(c.Address, c.Token)))
 	}
 	panel := make([]map[string]any, 0, len(po.Panel))
 	for _, s := range po.Panel {
@@ -795,7 +897,7 @@ func po0Main(args []string) (any, error) {
 		if u, err := url.Parse(s.URL); err == nil {
 			host = u.Host
 		}
-		panel = append(panel, map[string]any{"name": s.Name, "host": host})
+		panel = append(panel, withResult(map[string]any{"name": s.Name, "host": host}, s.URL))
 	}
 	return map[string]any{"success": true, "enabled": po.Enabled, "custom": custom, "panel": panel,
 		"report_count": len(po.reportURLs()), "fetched_at": po.PanelFetchedAt}, nil
@@ -940,6 +1042,21 @@ func splitPo0Token(token string) (string, string) {
 		return token[:i], token[i+1:]
 	}
 	return token, ""
+}
+
+// 上报地址 → 脱敏的 token（含 @槽位），写日志时区分同一台 po0 上的几个 token；认不出来返回空
+func po0URLLabel(u *url.URL) string {
+	parts := strings.Split(strings.Trim(u.Path, "/"), "/")
+	for i, p := range parts {
+		if strings.HasPrefix(p, "pgnfw_") && i+1 < len(parts) {
+			token := p
+			if slot := u.Query().Get("slot"); slot != "" {
+				token += "@" + slot
+			}
+			return maskPo0Token(token)
+		}
+	}
+	return ""
 }
 
 // 上报地址：https://<地址>/api/firewall/<token 去掉 @槽位>/add[?slot=N]（与主控同一拼法）

@@ -168,6 +168,12 @@ func (p *Proxy) MarshalJSON() ([]byte, error) {
 				}
 			}
 		}
+		// 喵窝白名单直连的节点（OpenWrt 给它写了 interface-name: tailscale0）带喵窝小标；入口小标优先
+		if icon, _ := mapping["icon"].(string); icon == "" {
+			if icon := entryoverride.MeshIcon(proxyInfo.Interface); icon != "" {
+				mapping["icon"] = icon
+			}
+		}
 	}
 
 	return json.Marshal(mapping)

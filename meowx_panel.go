@@ -10,7 +10,7 @@ package main
 //	meowx-core panel ggy status | enable | disable | add <token 或分享链接> [备注] | note <序号> [备注] | remove <序号> | report（meowx_ggy.go）
 //	meowx-core panel akile status | enable | disable | setkey … | clearkey | nodes … | rules … | add … | remove … | report [--timer]
 //	                                                       （AkileCDN 白名单，meowx_akile.go）
-//	meowx-core panel mesh status | sites … | enroll … | devices | delete …（喵窝，meowx_mesh.go）
+//	meowx-core panel mesh status | sites … | enroll … | devices | view | delete …（喵窝，meowx_mesh.go）
 //	meowx-core panel speedtest-grant <payload_hash>（测速榜上传凭证，外壳的测速页上传前要）
 //	meowx-core panel realtime-config（打印 {"base","token"}，外壳原样 PUT 给内核的 /meowx/realtime 接上实时通道）
 //
@@ -51,6 +51,9 @@ type panelState struct {
 	Avatar    string `json:"avatar,omitempty"`
 	ReportURL string `json:"report_url,omitempty"`
 	LoginAt   int64  `json:"login_at,omitempty"`
+	// 主控「订阅地址」（订阅域名，scheme + 主机）：外壳据此认出挂在订阅域名上的本主控订阅（拉订阅时带 X-MeowX-Mesh）。
+	// 登录与列账户订阅时更新；老的 panel.json 没有，外壳退回只认主控域名
+	SubBase string `json:"sub_base,omitempty"`
 }
 
 // 访问主控与上报白名单都必须直连（主控只把来源 IP 加白；走代理会把节点的 IP 加进去，同客户端「上报必须直连」）。
@@ -207,7 +210,13 @@ func panelMain(args []string) int {
 	enc := json.NewEncoder(os.Stdout)
 	enc.SetEscapeHTML(false)
 	if err != nil {
-		_ = enc.Encode(map[string]any{"success": false, "error": err.Error()})
+		fail := map[string]any{"success": false, "error": err.Error()}
+		// 喵窝管理接口的业务状态码（401 / 403 / 409 / 429 / 502…），外壳按它决定要不要重查状态、保不保留本机身份
+		var he interface{ HTTPStatus() int }
+		if errors.As(err, &he) && he.HTTPStatus() != 0 {
+			fail["http_status"] = he.HTTPStatus()
+		}
+		_ = enc.Encode(fail)
 		return 1
 	}
 	_ = enc.Encode(out)
@@ -256,6 +265,11 @@ func panelLogin(link string) (any, error) {
 	if fw, err := panelRPC(base, "/user/firewall-token", "GET", token, nil); err == nil {
 		st.ReportURL, _ = fw["report_url"].(string)
 	}
+	// 订阅域名同样跟着账号走：拿不到不影响登录
+	if cfg, err := panelRPC(base, "/user/config", "GET", token, nil); err == nil {
+		raw, _ := cfg["subscription_url"].(string)
+		st.SubBase = panelSubscriptionBase(raw, base)
+	}
 	if err := st.save(); err != nil {
 		return nil, err
 	}
@@ -282,8 +296,12 @@ func panelStatus() (any, error) {
 	if err != nil {
 		return map[string]any{"success": true, "logged_in": false}, nil
 	}
-	return map[string]any{"success": true, "logged_in": true, "username": st.Username, "avatar": st.Avatar,
-		"base": st.Base, "report_url": st.ReportURL != ""}, nil
+	out := map[string]any{"success": true, "logged_in": true, "username": st.Username, "avatar": st.Avatar,
+		"base": st.Base, "report_url": st.ReportURL != ""}
+	if st.SubBase != "" {
+		out["sub_base"] = st.SubBase
+	}
+	return out, nil
 }
 
 // 向主控重取昵称与头像（只在用户点刷新时调，同客户端）
@@ -367,6 +385,10 @@ func panelSubscriptions() (any, error) {
 	if obj, err := panelRPC(st.Base, "/user/config", "GET", st.Token, nil); err == nil {
 		raw, _ := obj["subscription_url"].(string)
 		subBase = panelSubscriptionBase(raw, st.Base)
+		if subBase != st.SubBase {
+			st.SubBase = subBase
+			_ = st.save()
+		}
 	}
 	raw, err := panelRPCRaw(st.Base, "/subscriptions", "GET", st.Token, nil)
 	if err != nil {
@@ -1113,9 +1135,16 @@ func panelRPC(base, path, method, token string, payload map[string]any) (map[str
 // 信封 = 临时公钥(32) ‖ nonce(12) ‖ 密文+tag；应答整体是 nonce(12) ‖ 密文+tag，成功和出错都是密文。
 // 加解密与客户端、内核的实时通道同一套（component/panelsecure）。
 func panelRPCRaw(base, path, method, token string, payload map[string]any) ([]byte, error) {
+	out, _, err := panelRPCRawStatus(base, path, method, token, payload)
+	return out, err
+}
+
+// panelRPCRawStatus 同 panelRPCRaw，另带回业务 HTTP 状态码（加密 RPC 保留业务接口的状态码：401 / 403 / 409 / 502…，
+// 喵窝管理接口按它分别提示）
+func panelRPCRawStatus(base, path, method, token string, payload map[string]any) ([]byte, int, error) {
 	masterPub, err := panelMasterKey(base)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	inner := map[string]any{}
 	for k, v := range payload {
@@ -1132,32 +1161,32 @@ func panelRPCRaw(base, path, method, token string, payload map[string]any) ([]by
 	inner["nonce"] = hex.EncodeToString(nonceID)
 	plain, err := json.Marshal(inner)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 
 	envelope, keyS2C, err := panelsecure.SealRPC(masterPub, plain)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	req, err := http.NewRequest("POST", base+"/api/secure/rpc", bytes.NewReader(envelope))
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	req.Header.Set("Content-Type", "application/octet-stream")
 	resp, err := panelHTTP.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("连不上主控：%v", err)
+		return nil, 0, fmt.Errorf("连不上主控：%v", err)
 	}
 	defer resp.Body.Close()
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
 	if err != nil {
-		return nil, err
+		return nil, resp.StatusCode, err
 	}
 	out, err := panelsecure.OpenRPC(keyS2C, body)
 	if err != nil {
-		return nil, fmt.Errorf("主控应答无法解密（HTTP %d）", resp.StatusCode)
+		return nil, resp.StatusCode, fmt.Errorf("主控应答无法解密（HTTP %d）", resp.StatusCode)
 	}
-	return out, nil
+	return out, resp.StatusCode, nil
 }
 
 // 取主控证书并用许可证公钥验签：域名必须与主控地址一致、没过期（同客户端 MasterCert.verified）

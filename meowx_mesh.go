@@ -10,7 +10,12 @@ package main
 //	                                                       多台路由器各申报各的
 //	meowx-core panel mesh enroll <主机名> [<上次的设备编号>]  拿一次性入网 key（10 分钟内有效）
 //	meowx-core panel mesh devices                          本账号的设备与站点
+//	meowx-core panel mesh view                             喵窝页用：status + （在名单里时）devices，一次拿齐（devices 回 403 时重查 status）
 //	meowx-core panel mesh delete <设备编号>                  从喵窝删掉一台设备
+//
+// status / devices 的应答先整理一遍再输出（meowx_mesh_view.go）：缺字段、null 一律当空列表，共享设备里只有网段的站点路由器
+// 标成 kind=site，预留的 servers 只留有名称与喵窝地址的条目。出错时按业务状态码给出提示（401 / 403 / 409 / 429 / 503 / 502），
+// 并在输出里带 http_status（见 panelMain）。
 
 import (
 	"encoding/json"
@@ -27,7 +32,7 @@ var meshDigits = regexp.MustCompile(`^[0-9]{1,19}$`)
 
 func meshMain(args []string) (any, error) {
 	if len(args) == 0 {
-		return nil, errors.New("usage: meowx-core panel mesh status | sites --router <标识> [--force-map] <网段>… | enroll <主机名> [<设备编号>] | devices | delete <设备编号>")
+		return nil, errors.New("usage: meowx-core panel mesh status | sites --router <标识> [--force-map] <网段>… | enroll <主机名> [<设备编号>] | devices | view | delete <设备编号>")
 	}
 	st, err := loadPanelState()
 	if err != nil {
@@ -35,7 +40,11 @@ func meshMain(args []string) (any, error) {
 	}
 	switch args[0] {
 	case "status":
-		return meshCall(st, "/user/mesh/status", "GET", nil)
+		obj, err := meshCall(st, "/user/mesh/status", "GET", nil)
+		if err != nil {
+			return nil, err
+		}
+		return normalizeMeshStatus(obj), nil
 	case "sites":
 		force := false
 		router := ""
@@ -78,7 +87,13 @@ func meshMain(args []string) (any, error) {
 		}
 		return meshCall(st, "/user/mesh/enroll", "POST", payload)
 	case "devices":
-		return meshCall(st, "/user/mesh/devices", "GET", nil)
+		obj, err := meshCall(st, "/user/mesh/devices", "GET", nil)
+		if err != nil {
+			return nil, err
+		}
+		return normalizeMeshDevices(obj), nil
+	case "view":
+		return meshView(st), nil
 	case "delete":
 		if len(args) < 2 || !meshDigits.MatchString(args[1]) {
 			return nil, errors.New("设备编号不对")
@@ -89,17 +104,78 @@ func meshMain(args []string) (any, error) {
 	}
 }
 
-// meshCall 发一次加密 RPC。主控出错时回 {"error": "…"}（HTTP 状态码在信封外面，这里看不到），当错误返回。
-func meshCall(st *panelState, path, method string, payload map[string]any) (any, error) {
-	raw, err := panelRPCRaw(st.Base, path, method, st.Token, payload)
+// meshView 喵窝页的一次读取：status 拿不到就整体报错（外壳显示原因）；devices 失败不影响 status，原因放 devices_error。
+// devices 回 403（多半刚被移出名单）时重查一次 status，按新的 status 画（not_admin 就不再列共享设备）。
+func meshView(st *panelState) map[string]any {
+	out := map[string]any{"success": true}
+	status, err := meshCall(st, "/user/mesh/status", "GET", nil)
 	if err != nil {
+		out["success"] = false
+		out["error"] = err.Error()
+		if he, ok := err.(*meshError); ok {
+			out["http_status"] = he.status
+		}
+		return out
+	}
+	ns := normalizeMeshStatus(status)
+	out["status"] = ns
+	if in, _ := ns["in_list"].(bool); !in {
+		return out
+	}
+	devices, err := meshCall(st, "/user/mesh/devices", "GET", nil)
+	if err != nil {
+		out["devices_error"] = err.Error()
+		if he, ok := err.(*meshError); ok {
+			out["devices_http_status"] = he.status
+			if he.status == 403 {
+				if again, e := meshCall(st, "/user/mesh/status", "GET", nil); e == nil {
+					out["status"] = normalizeMeshStatus(again)
+				}
+			}
+		}
+		return out
+	}
+	out["devices"] = normalizeMeshDevices(devices)
+	return out
+}
+
+// meshCall 发一次加密 RPC。加密 RPC 保留业务状态码：出错（{"error": "…"} 或 4xx / 5xx）时按状态码换成提示（meshErrorText），
+// 409 先重查一次 status 分清「主控关了喵窝」与「设备数到上限」。devices 在服务未就绪时会回 200 + error（照样带着已登记的站点），
+// 那种不当失败，原样交给外壳。
+func meshCall(st *panelState, path, method string, payload map[string]any) (map[string]any, error) {
+	raw, code, err := panelRPCRawStatus(st.Base, path, method, st.Token, payload)
+	if err != nil {
+		if code >= 400 {
+			return nil, &meshError{status: code, msg: meshErrorText(code, err.Error(), nil)}
+		}
 		return nil, err
 	}
 	var obj map[string]any
 	if err := json.Unmarshal(raw, &obj); err != nil {
+		if code >= 400 {
+			return nil, &meshError{status: code, msg: meshErrorText(code, "", nil)}
+		}
 		return nil, fmt.Errorf("主控应答无法解析：%v", err)
 	}
-	if msg, _ := obj["error"].(string); msg != "" {
+	msg, _ := obj["error"].(string)
+	if code >= 400 {
+		var status func() map[string]any
+		if code == 409 && path != "/user/mesh/status" {
+			status = func() map[string]any {
+				raw, c, err := panelRPCRawStatus(st.Base, "/user/mesh/status", "GET", st.Token, nil)
+				if err != nil || c >= 400 {
+					return nil
+				}
+				var s map[string]any
+				if json.Unmarshal(raw, &s) != nil {
+					return nil
+				}
+				return s
+			}
+		}
+		return nil, &meshError{status: code, msg: meshErrorText(code, msg, status)}
+	}
+	if msg != "" && path != "/user/mesh/devices" {
 		return nil, errors.New(msg)
 	}
 	return obj, nil

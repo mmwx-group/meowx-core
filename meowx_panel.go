@@ -10,7 +10,7 @@ package main
 //	meowx-core panel ggy status | enable | disable | add <token 或分享链接> [备注] | note <序号> [备注] | remove <序号> | report（meowx_ggy.go）
 //	meowx-core panel akile status | enable | disable | setkey … | clearkey | nodes … | rules … | add … | remove … | report [--timer]
 //	                                                       （AkileCDN 白名单，meowx_akile.go）
-//	meowx-core panel mesh status | sites … | enroll … | devices | view | delete …（喵窝，meowx_mesh.go）
+//	meowx-core panel mesh status | sites … | enroll … | devices | view | delete … | relay … | paths … | tick …（喵窝，meowx_mesh.go / meowx_mesh_relay.go）
 //	meowx-core panel speedtest-grant <payload_hash>（测速榜上传凭证，外壳的测速页上传前要）
 //	meowx-core panel realtime-config（打印 {"base","token"}，外壳原样 PUT 给内核的 /meowx/realtime 接上实时通道）
 //
@@ -215,6 +215,11 @@ func panelMain(args []string) int {
 		var he interface{ HTTPStatus() int }
 		if errors.As(err, &he) && he.HTTPStatus() != 0 {
 			fail["http_status"] = he.HTTPStatus()
+		}
+		// 设备中继接口的错误码（invalid_port / share_not_allowed / device_relay_disabled…），页面按它提示具体字段
+		var ce interface{ ErrorCode() string }
+		if errors.As(err, &ce) && ce.ErrorCode() != "" {
+			fail["error_code"] = ce.ErrorCode()
 		}
 		_ = enc.Encode(fail)
 		return 1

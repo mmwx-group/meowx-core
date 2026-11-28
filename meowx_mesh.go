@@ -12,6 +12,7 @@ package main
 //	meowx-core panel mesh devices                          本账号的设备与站点
 //	meowx-core panel mesh view                             喵窝页用：status + （在名单里时）devices，一次拿齐（devices 回 403 时重查 status）
 //	meowx-core panel mesh delete <设备编号>                  从喵窝删掉一台设备
+//	meowx-core panel mesh relay … | paths … | tick …         设备中继与路径（meowx_mesh_relay.go）
 //
 // status / devices 的应答先整理一遍再输出（meowx_mesh_view.go）：缺字段、null 一律当空列表，共享设备里只有网段的站点路由器
 // 标成 kind=site，预留的 servers 只留有名称与喵窝地址的条目。出错时按业务状态码给出提示（401 / 403 / 409 / 429 / 503 / 502），
@@ -32,13 +33,24 @@ var meshDigits = regexp.MustCompile(`^[0-9]{1,19}$`)
 
 func meshMain(args []string) (any, error) {
 	if len(args) == 0 {
-		return nil, errors.New("usage: meowx-core panel mesh status | sites --router <标识> [--force-map] <网段>… | enroll <主机名> [<设备编号>] | devices | view | delete <设备编号>")
+		return nil, errors.New("usage: meowx-core panel mesh status | sites --router <标识> [--force-map] <网段>… | enroll <主机名> [<设备编号>] | devices | view | delete <设备编号> | relay … | paths [--device <编号>] | tick --tailscale <cli> [--socket <sock>] --state <目录> [--force]")
+	}
+	// 这两个不经主控（tick 自己读登录状态：没登录也要按本机中继端口输出防火墙）
+	switch {
+	case args[0] == "tick":
+		return meshTick(args[1:])
+	case args[0] == "relay" && len(args) > 1 && args[1] == "local":
+		return meshRelayLocal(args[2:]), nil
 	}
 	st, err := loadPanelState()
 	if err != nil {
 		return nil, err
 	}
 	switch args[0] {
+	case "relay":
+		return meshRelayMain(st, args[1:])
+	case "paths":
+		return meshPaths(st, args[1:])
 	case "status":
 		obj, err := meshCall(st, "/user/mesh/status", "GET", nil)
 		if err != nil {

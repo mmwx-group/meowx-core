@@ -6,7 +6,6 @@ import (
 	"context"
 	"net/netip"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -110,100 +109,63 @@ func convertTailscaleStatus(st *ipnstate.Status, isRelayTarget func(*ipnstate.Pe
 	return out
 }
 
-// peerRelayAddr 从 PeerRelay（「ip:port:vni:N」，也认「ip:port:N」；IPv6 为「[ip]:port:…」）取出中继的地址与端口。
-func peerRelayAddr(relay string) (netip.Addr, uint16, bool) {
-	var host, rest string
+// peerRelayAddr 从 PeerRelay（「ip:port:vni:N」，也认「ip:port:N」；IPv6 为「[ip]:port:…」）取出中继的 IP。
+func peerRelayAddr(relay string) (netip.Addr, bool) {
+	var host string
 	if strings.HasPrefix(relay, "[") {
 		end := strings.Index(relay, "]")
 		if end < 0 {
-			return netip.Addr{}, 0, false
+			return netip.Addr{}, false
 		}
-		host, rest = relay[1:end], strings.TrimPrefix(relay[end+1:], ":")
+		host = relay[1:end]
 	} else {
 		i := strings.Index(relay, ":")
 		if i < 0 {
-			return netip.Addr{}, 0, false
+			return netip.Addr{}, false
 		}
-		host, rest = relay[:i], relay[i+1:]
+		host = relay[:i]
 	}
 	addr, err := netip.ParseAddr(host)
 	if err != nil {
-		return netip.Addr{}, 0, false
+		return netip.Addr{}, false
 	}
-	portText, _, _ := strings.Cut(rest, ":")
-	port, err := strconv.ParseUint(portText, 10, 16)
-	if err != nil {
-		port = 0 // 端口认不出时只按 IP 对
-	}
-	return addr.Unmap(), uint16(port), true
+	return addr.Unmap(), true
 }
 
 // peerRelayViaName 中继设备的名字：中继地址的 IP 对上哪台设备上报的端点（Addrs）就是哪台，对端自己不算。
-// 同一个公网 IP 后面常有好几台（家里的路由器、电脑、手机共用出口）：对上不止一台时先只留授权给本机的中继
-// （[isRelayTarget]），还是不止一台再看端口也对上的；仍不止一台就不认（为空，界面写「经设备中继」，不猜）。
+// 同一个公网 IP 后面常有好几台（家里的路由器、电脑、手机共用出口）：对上不止一台时只留授权给本机的中继
+// （[isRelayTarget]），仍不止一台就不认（为空，界面写「经设备中继」，不猜）。不看端口：中继端口（如 40000）
+// 与设备自己的 tailscale 端口本来就不同，按端口只会碰巧对上无关的设备。
 func peerRelayViaName(p *ipnstate.PeerStatus, peers []*ipnstate.PeerStatus, isRelayTarget func(*ipnstate.PeerStatus) bool) string {
-	addr, port, ok := peerRelayAddr(p.PeerRelay)
+	addr, ok := peerRelayAddr(p.PeerRelay)
 	if !ok {
 		return ""
 	}
-	var byIP, byPort []*ipnstate.PeerStatus
+	var byIP []*ipnstate.PeerStatus
 	for _, q := range peers {
 		if q == p {
 			continue
 		}
-		ipHit, portHit := false, false
 		for _, a := range q.Addrs {
-			ap, err := netip.ParseAddrPort(a)
-			if err != nil || ap.Addr().Unmap() != addr {
-				continue
-			}
-			ipHit = true
-			if port != 0 && ap.Port() == port {
-				portHit = true
+			if ap, err := netip.ParseAddrPort(a); err == nil && ap.Addr().Unmap() == addr {
+				byIP = append(byIP, q)
+				break
 			}
 		}
-		if ipHit {
-			byIP = append(byIP, q)
-		}
-		if portHit {
-			byPort = append(byPort, q)
-		}
 	}
-	if len(byIP) == 1 {
-		return peerShortName(byIP[0])
-	}
-	if len(byIP) == 0 {
-		return ""
-	}
-	if isRelayTarget != nil {
+	if len(byIP) > 1 && isRelayTarget != nil {
 		var targets []*ipnstate.PeerStatus
 		for _, q := range byIP {
 			if isRelayTarget(q) {
 				targets = append(targets, q)
 			}
 		}
-		if len(targets) == 1 {
-			return peerShortName(targets[0])
-		}
-		if len(targets) > 1 {
-			byIP = targets
-		}
+		byIP = targets
 	}
-	var hit *ipnstate.PeerStatus
-	for _, q := range byPort {
-		for _, c := range byIP {
-			if q == c {
-				if hit != nil {
-					return ""
-				}
-				hit = q
-			}
-		}
-	}
-	if hit == nil {
+	if len(byIP) != 1 {
 		return ""
 	}
-	return peerShortName(hit)
+	return peerShortName(byIP[0])
 }
 
 // peerShortName 设备名：HostName，没有时取 DNSName 的第一段（去掉 MagicDNS 后缀）。

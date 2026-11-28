@@ -92,7 +92,7 @@ func TestPeerRelayViaName(t *testing.T) {
 		{"同一公网 IP 两台、只有一台授权给本机", "203.0.113.9:40000:vni:1", onlyHome, "home-openwrt"},
 		{"同一公网 IP 两台、都没授权：不认", "203.0.113.9:40000:vni:1", func(*ipnstate.PeerStatus) bool { return false }, ""},
 		{"同一公网 IP 两台、都授权：不认", "203.0.113.9:40000:vni:1", func(*ipnstate.PeerStatus) bool { return true }, ""},
-		{"同一公网 IP 两台、端口也对上的只有一台", "203.0.113.9:52000:vni:7", nil, "laptop"},
+		{"同一公网 IP 两台、端口碰巧对上一台也不认（不看端口）", "203.0.113.9:52000:vni:7", nil, ""},
 		{"对不上", "192.0.2.1:40000:vni:1", nil, ""},
 		{"写法不对", "garbage", nil, ""},
 	}

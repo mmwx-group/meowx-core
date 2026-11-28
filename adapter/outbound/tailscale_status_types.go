@@ -38,6 +38,9 @@ type TailscalePeerStatus struct {
 	// PeerRelay 经设备中继时的中继地址（ip:port:vni:N，IPv6 为 [ip]:port:vni:N；空 = 没走设备中继）。
 	// 判路径时先看它，再看 CurAddr、Relay（走设备中继时 CurAddr 为空、Relay 照样有值）。
 	PeerRelay string `json:"peerRelay,omitempty"`
+	// PeerRelayVia 中继设备的名字（HostName）：拿 PeerRelay 的 IP 对本机设备列表里各设备上报的公网端点（Addrs）认出来的；
+	// 认不出（中继不在本机设备列表里、或它没上报这个地址）时为空，界面再用主控的路径汇总补。
+	PeerRelayVia string `json:"peerRelayVia,omitempty"`
 	// RxBytes / TxBytes 与这台设备之间收 / 发的字节数（本机 WireGuard 计数）
 	RxBytes int64 `json:"rxBytes,omitempty"`
 	TxBytes int64 `json:"txBytes,omitempty"`

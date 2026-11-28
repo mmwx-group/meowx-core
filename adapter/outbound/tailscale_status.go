@@ -4,11 +4,15 @@ package outbound
 
 import (
 	"context"
+	"net/netip"
 	"sort"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/metacubex/tailscale/ipn/ipnstate"
+	"github.com/metacubex/tailscale/tailcfg"
 )
 
 // MeowX：按出站名找到 tailscale 出站（配置重载后新旧两个同名出站会短暂并存，登记的是最新的那个；
@@ -56,10 +60,27 @@ func (t *Tailscale) Status(ctx context.Context) (*TailscaleStatus, error) {
 	if err != nil {
 		return nil, err
 	}
-	return convertTailscaleStatus(st), nil
+	// 中继 IP 对上不止一台设备时，只认授权给本机的中继：对方对本机有 relay-target 能力（WhoIs 的 CapMap = 它对本机的能力）。
+	// 只在走设备中继、且对不出唯一一台时才问，每台问一次
+	asked := map[*ipnstate.PeerStatus]bool{}
+	isRelayTarget := func(q *ipnstate.PeerStatus) bool {
+		if v, ok := asked[q]; ok {
+			return v
+		}
+		ok := false
+		if len(q.TailscaleIPs) > 0 {
+			if who, err := lc.WhoIs(ctx, q.TailscaleIPs[0].String()); err == nil && who != nil {
+				ok = who.CapMap.HasCapability(tailcfg.PeerCapabilityRelayTarget)
+			}
+		}
+		asked[q] = ok
+		return ok
+	}
+	return convertTailscaleStatus(st, isRelayTarget), nil
 }
 
-func convertTailscaleStatus(st *ipnstate.Status) *TailscaleStatus {
+// convertTailscaleStatus 转成给界面的状态。isRelayTarget：这台设备是不是授权给本机的中继（nil = 不知道）。
+func convertTailscaleStatus(st *ipnstate.Status, isRelayTarget func(*ipnstate.PeerStatus) bool) *TailscaleStatus {
 	out := &TailscaleStatus{
 		State:          st.BackendState,
 		AuthURL:        st.AuthURL,
@@ -71,14 +92,127 @@ func convertTailscaleStatus(st *ipnstate.Status) *TailscaleStatus {
 		self := convertTailscalePeer(st.Self)
 		out.Self = &self
 	}
+	peers := make([]*ipnstate.PeerStatus, 0, len(st.Peer))
 	for _, p := range st.Peer {
-		if p == nil {
+		if p != nil {
+			peers = append(peers, p)
+		}
+	}
+	// 按名字排序：输出顺序固定，认中继设备时同一个 IP 对上几台也总是挑同一台
+	sort.Slice(peers, func(i, j int) bool { return peers[i].HostName < peers[j].HostName })
+	for _, p := range peers {
+		peer := convertTailscalePeer(p)
+		if p.PeerRelay != "" {
+			peer.PeerRelayVia = peerRelayViaName(p, peers, isRelayTarget)
+		}
+		out.Peers = append(out.Peers, peer)
+	}
+	return out
+}
+
+// peerRelayAddr 从 PeerRelay（「ip:port:vni:N」，也认「ip:port:N」；IPv6 为「[ip]:port:…」）取出中继的地址与端口。
+func peerRelayAddr(relay string) (netip.Addr, uint16, bool) {
+	var host, rest string
+	if strings.HasPrefix(relay, "[") {
+		end := strings.Index(relay, "]")
+		if end < 0 {
+			return netip.Addr{}, 0, false
+		}
+		host, rest = relay[1:end], strings.TrimPrefix(relay[end+1:], ":")
+	} else {
+		i := strings.Index(relay, ":")
+		if i < 0 {
+			return netip.Addr{}, 0, false
+		}
+		host, rest = relay[:i], relay[i+1:]
+	}
+	addr, err := netip.ParseAddr(host)
+	if err != nil {
+		return netip.Addr{}, 0, false
+	}
+	portText, _, _ := strings.Cut(rest, ":")
+	port, err := strconv.ParseUint(portText, 10, 16)
+	if err != nil {
+		port = 0 // 端口认不出时只按 IP 对
+	}
+	return addr.Unmap(), uint16(port), true
+}
+
+// peerRelayViaName 中继设备的名字：中继地址的 IP 对上哪台设备上报的端点（Addrs）就是哪台，对端自己不算。
+// 同一个公网 IP 后面常有好几台（家里的路由器、电脑、手机共用出口）：对上不止一台时先只留授权给本机的中继
+// （[isRelayTarget]），还是不止一台再看端口也对上的；仍不止一台就不认（为空，界面写「经设备中继」，不猜）。
+func peerRelayViaName(p *ipnstate.PeerStatus, peers []*ipnstate.PeerStatus, isRelayTarget func(*ipnstate.PeerStatus) bool) string {
+	addr, port, ok := peerRelayAddr(p.PeerRelay)
+	if !ok {
+		return ""
+	}
+	var byIP, byPort []*ipnstate.PeerStatus
+	for _, q := range peers {
+		if q == p {
 			continue
 		}
-		out.Peers = append(out.Peers, convertTailscalePeer(p))
+		ipHit, portHit := false, false
+		for _, a := range q.Addrs {
+			ap, err := netip.ParseAddrPort(a)
+			if err != nil || ap.Addr().Unmap() != addr {
+				continue
+			}
+			ipHit = true
+			if port != 0 && ap.Port() == port {
+				portHit = true
+			}
+		}
+		if ipHit {
+			byIP = append(byIP, q)
+		}
+		if portHit {
+			byPort = append(byPort, q)
+		}
 	}
-	sort.Slice(out.Peers, func(i, j int) bool { return out.Peers[i].Name < out.Peers[j].Name })
-	return out
+	if len(byIP) == 1 {
+		return peerShortName(byIP[0])
+	}
+	if len(byIP) == 0 {
+		return ""
+	}
+	if isRelayTarget != nil {
+		var targets []*ipnstate.PeerStatus
+		for _, q := range byIP {
+			if isRelayTarget(q) {
+				targets = append(targets, q)
+			}
+		}
+		if len(targets) == 1 {
+			return peerShortName(targets[0])
+		}
+		if len(targets) > 1 {
+			byIP = targets
+		}
+	}
+	var hit *ipnstate.PeerStatus
+	for _, q := range byPort {
+		for _, c := range byIP {
+			if q == c {
+				if hit != nil {
+					return ""
+				}
+				hit = q
+			}
+		}
+	}
+	if hit == nil {
+		return ""
+	}
+	return peerShortName(hit)
+}
+
+// peerShortName 设备名：HostName，没有时取 DNSName 的第一段（去掉 MagicDNS 后缀）。
+func peerShortName(p *ipnstate.PeerStatus) string {
+	if p.HostName != "" {
+		return p.HostName
+	}
+	name, _, _ := strings.Cut(strings.TrimSuffix(p.DNSName, "."), ".")
+	return name
 }
 
 func convertTailscalePeer(p *ipnstate.PeerStatus) TailscalePeerStatus {

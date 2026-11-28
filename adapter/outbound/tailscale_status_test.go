@@ -4,7 +4,9 @@ package outbound
 
 import (
 	"context"
+	"encoding/json"
 	"net/netip"
+	"strings"
 	"testing"
 	"time"
 
@@ -21,20 +23,31 @@ func TestConvertTailscaleStatus(t *testing.T) {
 		Peer: map[key.NodePublic]*ipnstate.PeerStatus{
 			key.NewNode().Public(): {ID: "3", HostName: "openwrt", OS: "linux", TailscaleIPs: []netip.Addr{netip.MustParseAddr("100.124.214.252")}, Online: true, Active: true, CurAddr: "203.0.113.7:41641", Relay: "meowx-1"},
 			key.NewNode().Public(): {ID: "5", HostName: "mac", Relay: "meowx-1", LastSeen: seen},
+			key.NewNode().Public(): {ID: "7", HostName: "nas", Online: true, Active: true, Relay: "meowx-1", PeerRelay: "203.0.113.9:40000:vni:12345", RxBytes: 4200000, TxBytes: 980000, LastHandshake: seen},
 		},
 	}
 	out := convertTailscaleStatus(st)
 	if out.State != "Running" || out.Self == nil || out.Self.ID != "15" || out.Self.Addresses[0] != "100.69.123.58" {
 		t.Fatalf("self 不对：%+v", out)
 	}
-	if len(out.Peers) != 2 || out.Peers[0].Name != "mac" || out.Peers[1].Name != "openwrt" {
+	if len(out.Peers) != 3 || out.Peers[0].Name != "mac" || out.Peers[1].Name != "nas" || out.Peers[2].Name != "openwrt" {
 		t.Fatalf("对端应按名字排序：%+v", out.Peers)
 	}
-	if p := out.Peers[1]; p.CurAddr != "203.0.113.7:41641" || p.Relay != "meowx-1" || !p.Online || !p.Active {
+	if p := out.Peers[2]; p.CurAddr != "203.0.113.7:41641" || p.Relay != "meowx-1" || !p.Online || !p.Active {
 		t.Fatalf("直连 / 中继不对：%+v", p)
 	}
 	if p := out.Peers[0]; p.CurAddr != "" || p.Online || p.LastSeen != "2026-11-06T08:00:00Z" {
 		t.Fatalf("离线设备不对：%+v", p)
+	}
+	if p := out.Peers[0]; p.PeerRelay != "" || p.RxBytes != 0 || p.LastHandshake != "" {
+		t.Fatalf("没走设备中继、没握过手时这几项应为空：%+v", p)
+	}
+	if p := out.Peers[1]; p.PeerRelay != "203.0.113.9:40000:vni:12345" || p.RxBytes != 4200000 || p.TxBytes != 980000 || p.LastHandshake != "2026-11-06T08:00:00Z" {
+		t.Fatalf("设备中继 / 计数 / 握手不对：%+v", p)
+	}
+	// 零值不输出
+	if b, _ := json.Marshal(out.Peers[0]); strings.Contains(string(b), "peerRelay") || strings.Contains(string(b), "lastHandshake") || strings.Contains(string(b), "rxBytes") {
+		t.Fatalf("零值不该输出：%s", b)
 	}
 	// 没登记（Self 没有 ID）时不带 self
 	if out := convertTailscaleStatus(&ipnstate.Status{BackendState: "NeedsLogin", Self: &ipnstate.PeerStatus{}}); out.Self != nil || out.Peers == nil {

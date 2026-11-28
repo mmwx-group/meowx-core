@@ -90,6 +90,10 @@ func convertTailscalePeer(p *ipnstate.PeerStatus) TailscalePeerStatus {
 	if !p.LastSeen.IsZero() {
 		lastSeen = p.LastSeen.UTC().Format(time.RFC3339)
 	}
+	var lastHandshake string
+	if !p.LastHandshake.IsZero() {
+		lastHandshake = p.LastHandshake.UTC().Format(time.RFC3339)
+	}
 	return TailscalePeerStatus{
 		ID:        string(p.ID),
 		Name:      p.HostName,
@@ -101,5 +105,10 @@ func convertTailscalePeer(p *ipnstate.PeerStatus) TailscalePeerStatus {
 		CurAddr:   p.CurAddr,
 		Relay:     p.Relay,
 		LastSeen:  lastSeen,
+
+		PeerRelay:     p.PeerRelay,
+		RxBytes:       p.RxBytes,
+		TxBytes:       p.TxBytes,
+		LastHandshake: lastHandshake,
 	}
 }

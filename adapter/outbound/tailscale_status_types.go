@@ -33,8 +33,16 @@ type TailscalePeerStatus struct {
 	Active bool `json:"active"`
 	// CurAddr 直连用的地址（空 = 没打通直连）
 	CurAddr string `json:"curAddr,omitempty"`
-	// Relay 用的中继区域
+	// Relay 经中继服务器（DERP）时的区域代码（如 meowx-7 / meowx-7-alt）
 	Relay string `json:"relay,omitempty"`
+	// PeerRelay 经设备中继时的中继地址（ip:port:vni:N，IPv6 为 [ip]:port:vni:N；空 = 没走设备中继）。
+	// 判路径时先看它，再看 CurAddr、Relay（走设备中继时 CurAddr 为空、Relay 照样有值）。
+	PeerRelay string `json:"peerRelay,omitempty"`
+	// RxBytes / TxBytes 与这台设备之间收 / 发的字节数（本机 WireGuard 计数）
+	RxBytes int64 `json:"rxBytes,omitempty"`
+	TxBytes int64 `json:"txBytes,omitempty"`
+	// LastHandshake 最近一次 WireGuard 握手成功的时刻（RFC 3339，没握过手时不输出）
+	LastHandshake string `json:"lastHandshake,omitempty"`
 	// LastSeen 离线时最后在线的时刻（RFC 3339）
 	LastSeen string `json:"lastSeen,omitempty"`
 }
